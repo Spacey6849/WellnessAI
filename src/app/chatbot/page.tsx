@@ -7,10 +7,10 @@ import {
   Mic,
   RefreshCw,
   Send,
-  Paperclip,
   Sparkles,
-  // X (removed unused)
 } from "lucide-react";
+import talkingGif from "../../../gifs/talking.gif";
+import stationaryGif from "../../../gifs/stationary.gif";
 
 type Mode = "chat" | "speech";
 
@@ -44,6 +44,7 @@ export default function ChatbotPage() {
   const messages = activeConversation.messages;
   const [input, setInput] = useState("");
   const [recording, setRecording] = useState(false);
+  const [streamingText, setStreamingText] = useState("");
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const listRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -104,8 +105,47 @@ export default function ChatbotPage() {
     inputRef.current?.focus();
   };
 
+  // simplistic streaming simulation: when recording starts, incrementally build a mock transcript
+  useEffect(() => {
+    if (recording) {
+      setStreamingText("");
+      const phrases = [
+        "Taking a deep breath…",
+        "Acknowledging how you feel…",
+        "Offering a grounding technique…",
+        "Suggesting the next small step…",
+      ];
+      let i = 0;
+      const interval = setInterval(() => {
+        setStreamingText((prev) => prev + (prev ? "\n" : "") + phrases[i]);
+        i++;
+        if (i >= phrases.length) clearInterval(interval);
+      }, 1200);
+      return () => clearInterval(interval);
+    }
+  }, [recording]);
+
+  const finalizeStreaming = () => {
+    if (!streamingText.trim()) return;
+    setConversations((prev) => prev.map((c) => c.id === activeId ? {
+      ...c,
+      messages: [
+        ...c.messages,
+        { id: crypto.randomUUID(), role: "assistant", content: streamingText },
+      ],
+    } : c));
+    setStreamingText("");
+  };
+
   const toggleRecording = () => {
-    setRecording((r) => !r);
+    setRecording((r) => {
+      if (r) {
+        // stopping
+        finalizeStreaming();
+        return false;
+      }
+      return true;
+    });
   };
 
   return (
@@ -222,41 +262,54 @@ export default function ChatbotPage() {
           )}
 
           {mode === "speech" && messages.length === 0 && (
-            <div className="mt-12 flex flex-col items-center gap-8 text-center">
-              <p className="text-sm text-slate-300 max-w-sm">Tap the microphone to start recording your prompt. We&apos;ll transcribe and respond with contextual guidance.</p>
-              <div className="flex flex-col items-center gap-6">
-                <div className="relative h-48 w-48 overflow-hidden rounded-full border border-white/10 shadow-lg shadow-blue-500/20">
-                  <Image
-                    src={recording ? "/gifs/talking.gif" : "/gifs/stationary.gif"}
-                    alt="AI animated avatar"
-                    fill
-                    className="object-cover"
-                    unoptimized
-                    priority
-                  />
-                </div>
-                <button
-                  type="button"
-                  onClick={toggleRecording}
-                  aria-pressed={recording}
-                  className={`relative flex h-28 w-28 items-center justify-center rounded-full transition focus:outline-none focus-visible:ring-4 focus-visible:ring-blue-400/40 ${
-                    recording
-                      ? "bg-gradient-to-br from-rose-500 via-orange-500 to-yellow-500 animate-pulse"
-                      : "bg-gradient-to-br from-blue-500 via-indigo-500 to-emerald-500"
-                  }`}
-                >
-                  <Mic className="h-10 w-10 text-white drop-shadow" />
-                  {recording && <span className="absolute -bottom-6 text-xs uppercase tracking-[0.3em] text-rose-300">LISTENING…</span>}
-                </button>
-              </div>
+            <div className="mt-12 hidden" aria-hidden>
+              {/* Old speech hero replaced by new two-column layout below */}
             </div>
           )}
         </div>
 
-        {/* Conversation panel */}
-        {messages.length > 0 && (
-          <div className="flex flex-1 flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-900/60 backdrop-blur-xl">
+        {/* Unified panel area for chat/speech */}
+        <div className="flex flex-1 gap-6">
+          {/* Left column (speech avatar when in speech mode) */}
+          {mode === "speech" && (
+            <div className="relative flex w-72 flex-col items-center justify-start rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur-xl">
+              <div className="relative h-56 w-56 overflow-hidden rounded-full border border-white/10 shadow-lg shadow-blue-500/20">
+                <Image
+                  src={recording ? talkingGif : stationaryGif}
+                  alt="AI animated avatar"
+                  fill
+                  className="object-cover"
+                  unoptimized
+                  priority
+                />
+              </div>
+              <button
+                type="button"
+                onClick={toggleRecording}
+                aria-pressed={recording}
+                className={`mt-8 relative flex h-20 w-20 items-center justify-center rounded-full transition focus:outline-none focus-visible:ring-4 focus-visible:ring-blue-400/40 ${
+                  recording
+                    ? "bg-gradient-to-br from-rose-500 via-orange-500 to-yellow-500 animate-pulse"
+                    : "bg-gradient-to-br from-blue-500 via-indigo-500 to-emerald-500"
+                }`}
+              >
+                <Mic className="h-8 w-8 text-white drop-shadow" />
+                {recording && <span className="absolute -bottom-6 text-[10px] uppercase tracking-[0.3em] text-rose-300">LISTENING…</span>}
+              </button>
+              {streamingText && (
+                <p className="mt-10 w-full whitespace-pre-wrap rounded-xl border border-white/10 bg-white/5 p-4 text-xs leading-relaxed text-slate-200">
+                  {streamingText}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Right column (messages) */}
+          <div className="flex min-h-[400px] flex-1 flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-900/60 backdrop-blur-xl">
             <div ref={listRef} className="flex-1 space-y-6 overflow-y-auto px-6 py-8 text-sm">
+              {messages.length === 0 && mode === "speech" && !streamingText && (
+                <p className="text-center text-sm text-slate-400">Your transcribed guidance will appear here.</p>
+              )}
               {messages.map((m) => (
                 <div key={m.id} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
                   <div
@@ -270,9 +323,16 @@ export default function ChatbotPage() {
                   </div>
                 </div>
               ))}
+              {mode === "speech" && streamingText && (
+                <div className="flex justify-start">
+                  <div className="max-w-[70%] whitespace-pre-wrap rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-slate-100">
+                    {streamingText}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
-        )}
+        </div>
 
         {/* Input bar */}
         <div className="sticky bottom-4 mt-auto rounded-2xl border border-white/10 bg-white/5 p-3 backdrop-blur-xl">
@@ -314,10 +374,7 @@ export default function ChatbotPage() {
                   </div>
                 </div>
               )}
-              <div className="flex items-center gap-2 px-1 pb-1 text-[11px] uppercase tracking-[0.3em] text-slate-400">
-                <span className="inline-flex items-center gap-1"><Paperclip className="h-3.5 w-3.5" /> Attach</span>
-                <span className="inline-flex items-center gap-1"><Sparkles className="h-3.5 w-3.5" /> Enhance</span>
-              </div>
+              {/* Accessory controls removed per request (Attach / Enhance) */}
             </div>
             {mode === "chat" && (
               <button
