@@ -1,0 +1,27 @@
+{
+  "posts": [
+    {
+      "id": "1f364a26d7cd276d",
+      "content": "what's up ?",
+      "createdAt": "2025-09-26T10:08:47.067Z",
+      "likes": [],
+      "replies": []
+    },
+    {
+      "id": "e304cf47be1d2754",
+      "content": "hello whats up",
+      "createdAt": "2025-09-26T10:00:58.035Z",
+      "likes": [
+        "f3946264f933c3dca845"
+      ],
+      "replies": [
+        {
+          "id": "da73c96c64c62ecd",
+          "postId": "e304cf47be1d2754",
+          "content": "hey",
+          "createdAt": "2025-09-26T10:01:09.282Z"
+        }
+      ]
+    }
+  ]
+}

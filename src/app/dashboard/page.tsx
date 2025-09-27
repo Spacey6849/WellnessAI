@@ -12,7 +12,6 @@ import {
   Legend,
 } from "recharts";
 import {
-  Activity,
   ArrowUpRight,
   Bot,
   CalendarCheck,
@@ -27,66 +26,19 @@ import {
   ShieldCheck,
   Sparkles,
   Users,
+  Moon,
+  ChevronRight,
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
+import { fetchRecentMoodEntries } from "@/lib/supabase";
+import { useSession } from '@/lib/useSession';
 
-const metricsByTimeframe = {
-  weekly: [
-    { label: "Sat", mood: 6.2, sleep: 7.5, health: 5.4 },
-    { label: "Sun", mood: 7.4, sleep: 8, health: 6.1 },
-    { label: "Mon", mood: 5.1, sleep: 6.2, health: 5 },
-    { label: "Tue", mood: 6.3, sleep: 7, health: 5.6 },
-    { label: "Wed", mood: 4.8, sleep: 5.8, health: 4.9 },
-    { label: "Thu", mood: 5.7, sleep: 6.4, health: 5.2 },
-    { label: "Fri", mood: 6.9, sleep: 7.2, health: 5.9 },
-  ],
-  monthly: [
-    { label: "Week 1", mood: 6.8, sleep: 7.1, health: 5.8 },
-    { label: "Week 2", mood: 7.2, sleep: 7.6, health: 6.2 },
-    { label: "Week 3", mood: 6.3, sleep: 6.9, health: 5.6 },
-    { label: "Week 4", mood: 7.1, sleep: 7.4, health: 6.1 },
-  ],
-} as const;
+// Runtime series fetched from /api/dashboard/summary (weekly granularity). Monthly placeholder collapses into 4 averaged buckets.
+type TrendSummary = { days: string[]; mood: number[]; sleep: number[]; health: number[] };
 
-const statCards = [
-  {
-    title: "Mood Score",
-    value: "7.2/10",
-    delta: "+0.4",
-    helper: "vs last week",
-    trend: "up" as const,
-    icon: HeartPulse,
-    accent: "from-sky-500/80 via-blue-500/30",
-  },
-  {
-    title: "Sleep Quality",
-    value: "74%",
-    delta: "+12%",
-    helper: "7h goal",
-    trend: "up" as const,
-    icon: Clock,
-    accent: "from-indigo-500/80 via-indigo-500/30",
-  },
-  {
-    title: "AI Sessions",
-    value: "2",
-    delta: "-1",
-    helper: "vs target",
-    trend: "down" as const,
-    icon: MessageCircle,
-    accent: "from-fuchsia-500/80 via-purple-500/30",
-  },
-  {
-    title: "Community Touches",
-    value: "0",
-    delta: "0",
-    helper: "posts this week",
-    trend: "flat" as const,
-    icon: Users,
-    accent: "from-emerald-500/80 via-emerald-500/30",
-  },
-];
+import type { LucideIcon } from 'lucide-react';
+interface StatCardData { title: string; value: string; delta: string; helper: string; trend: 'up'|'down'|'flat'; icon: LucideIcon; accent: string; }
 
 const quickActions = [
   {
@@ -119,22 +71,13 @@ const quickActions = [
   },
 ];
 
-const focusTasks = [
-  {
-    id: "breathing",
-    title: "3-min breathing reset",
-    detail: "Guided by AI Companion",
-  },
-  {
-    id: "gratitude",
-    title: "Log a gratitude note",
-    detail: "Boosts mood awareness",
-  },
-  {
-    id: "stretch",
-    title: "Mindful stretch",
-    detail: "Release tension before bed",
-  },
+const SUGGESTIONS = [
+  { id: 'breathing', title: '3-min breathing reset', detail: 'Guided by AI Companion' },
+  { id: 'gratitude', title: 'Log a gratitude note', detail: 'Boosts mood awareness' },
+  { id: 'stretch', title: 'Mindful stretch', detail: 'Release tension before bed' },
+  { id: 'journal', title: 'Write a micro-journal', detail: 'Capture one sentence reflection' },
+  { id: 'hydrate', title: 'Drink water', detail: 'Hydration supports clarity' },
+  { id: 'movement', title: '2-min posture reset', detail: 'Unwind shoulder tension' },
 ];
 
 const moodOptions = [
@@ -145,41 +88,188 @@ const moodOptions = [
   { label: "Awful", value: "awful", emoji: "😞" },
 ];
 
-const healthIndicators = [
-  { label: "Energy", value: 42, color: "bg-blue-400" },
-  { label: "Focus", value: 58, color: "bg-indigo-400" },
-  { label: "Stress", value: 31, color: "bg-emerald-400" },
-];
+interface Indicator { label: string; value: number; color: string }
 
-const upcomingSessions = [
-  { label: "Mindfulness class", time: "Today • 6:00 PM", type: "Community" },
-  { label: "Therapist session", time: "Tue • 11:30 AM", type: "Virtual" },
-  { label: "AI check-in", time: "Thu • 9:00 PM", type: "Auto" },
-];
+// Upcoming sessions are now dynamically loaded from /api/bookings/upcoming
+interface UpcomingBooking { id: string; therapistId: string | null; therapistName: string | null; date: string; slot: string; sessionType: string | null; notes: string | null }
 
-const timeframeOptions: Array<keyof typeof metricsByTimeframe> = [
-  "weekly",
-  "monthly",
-];
+const timeframeOptions: Array<'weekly'|'monthly'> = ['weekly','monthly'];
 
 function classNames(...values: Array<string | undefined | null | false>) {
   return values.filter(Boolean).join(" ");
 }
 
 export default function DashboardPage() {
+  const { session } = useSession();
+  const displayName = session?.user?.name || (typeof window !== 'undefined' ? (window.localStorage.getItem('wellnessai:username') || '') : '');
+  // Derive a friendlier short form (split on space / use before @)
+  const friendlyName = displayName
+    ? (displayName.includes(' ') ? displayName.split(' ')[0] : displayName.split('@')[0])
+    : 'Friend';
+  // Health Check multi-step state
   const [selectedMood, setSelectedMood] = useState<string>("okay");
-  const [timeframe, setTimeframe] = useState<keyof typeof metricsByTimeframe>(
-    "weekly",
-  );
+  const [sleepInput, setSleepInput] = useState<string>("");
+  const [healthStep, setHealthStep] = useState<1|2>(1); // 1 = mood, 2 = sleep
+  const [submittingHealth, setSubmittingHealth] = useState(false);
+  const [timeframe, setTimeframe] = useState<'weekly'|'monthly'>("weekly");
   const [journalEntry, setJournalEntry] = useState("");
-  const [entries, setEntries] = useState<string[]>([]);
+  const [journalTopic, setJournalTopic] = useState("");
+  const [entries, setEntries] = useState<{ id: string; entry: string; created_at: string }[]>([]);
   const [journalSaved, setJournalSaved] = useState(false);
   const [completedTasks, setCompletedTasks] = useState<string[]>([]);
+  const [statCards, setStatCards] = useState<StatCardData[]>([]);
+  const [trend, setTrend] = useState<TrendSummary | null>(null);
+  const [indicators, setIndicators] = useState<Indicator[]>([]);
+  const [sleepHoursLatest, setSleepHoursLatest] = useState<number | null>(null);
+  const [focusTasks, setFocusTasks] = useState<typeof SUGGESTIONS>(SUGGESTIONS.slice(0,3));
+  const [loadingFocus, setLoadingFocus] = useState(false);
+  const [streak, setStreak] = useState<number>(0);
+  // loading flag reserved for potential skeleton states (currently unused but kept minimal)
+  // const [loadingSummary, setLoadingSummary] = useState(false);
+  const userId = typeof window !== 'undefined' ? window.localStorage.getItem('wellnessai:user_id') : null;
+  const [upcoming, setUpcoming] = useState<UpcomingBooking[] | null>(null);
+  const [loadingUpcoming, setLoadingUpcoming] = useState(false);
+  // Daily quote state
+  const [dailyQuote, setDailyQuote] = useState<{ quote: string; author: string; date: string; cached?: boolean; regenerated?: boolean }|null>(null);
+  const [quoteLoading, setQuoteLoading] = useState(false);
+  const [quoteError, setQuoteError] = useState<string|null>(null);
 
-  const chartSeries = useMemo(
-    () => metricsByTimeframe[timeframe].map((point) => ({ ...point })),
-    [timeframe],
-  );
+  const fetchUpcoming = useCallback(async () => {
+    if(!userId) return;
+    setLoadingUpcoming(true);
+    try {
+      const res = await fetch('/api/bookings/upcoming', { headers: { 'x-user-id': userId }});
+      const json = await res.json();
+      if(res.ok && Array.isArray(json.bookings)) setUpcoming(json.bookings);
+      else if(!res.ok) setUpcoming([]);
+    } catch { setUpcoming([]); } finally { setLoadingUpcoming(false); }
+  }, [userId]);
+
+  const refreshSuggestions = () => {
+    const shuffled = [...SUGGESTIONS].sort(()=>Math.random()-0.5).slice(0,3);
+    setFocusTasks(shuffled);
+  };
+
+  const fetchDailyFocus = async () => {
+    setLoadingFocus(true);
+    try {
+      const res = await fetch('/api/daily-focus');
+      const j = await res.json();
+      if(res.ok && Array.isArray(j.tasks)) setFocusTasks(j.tasks);
+    } finally { setLoadingFocus(false); }
+  };
+
+  function mapMoodToScore(val: string){
+    switch(val){
+      case 'excellent': return 9;
+      case 'good': return 7;
+      case 'okay': return 5;
+      case 'bad': return 3;
+      case 'awful': return 1;
+      default: return 5;
+    }
+  }
+
+  const fetchSummary = useCallback(async () => {
+    if(!userId) return;
+    try {
+      // Attempt API summary first for aggregated fields.
+      const res = await fetch('/api/dashboard/summary', { headers: { 'x-user-id': userId }});
+      if(res.ok){
+        const json = await res.json();
+        const cards: StatCardData[] = [
+          { title: 'Mood Score', value: `${json.moodScore.toFixed(1)}/10`, delta: '+0', helper: 'vs last week', trend: 'flat', icon: HeartPulse, accent: 'from-sky-500/80 via-blue-500/30' },
+          { title: 'Sleep Quality', value: `${json.sleepQuality}%`, delta: '+0', helper: '7h goal', trend: 'flat', icon: Clock, accent: 'from-indigo-500/80 via-indigo-500/30' },
+          { title: 'AI Sessions', value: `${json.aiSessions}`, delta: '0', helper: 'total', trend: 'flat', icon: MessageCircle, accent: 'from-fuchsia-500/80 via-purple-500/30' },
+          { title: 'Community Touches', value: `${json.communityTouches}`, delta: '0', helper: 'posts', trend: 'flat', icon: Users, accent: 'from-emerald-500/80 via-emerald-500/30' },
+        ];
+        setStatCards(cards);
+        setTrend(json.trends);
+        setSleepHoursLatest(json.trends.sleep.slice(-1)[0] ?? null);
+        setStreak(json.streak || 0);
+        const energy = Math.round((json.trends.health.slice(-1)[0] || 0) * 6);
+        const focus = Math.round((json.moodScore/10)*100);
+        const stress = Math.max(0, 100 - focus);
+        setIndicators([
+          { label:'Energy', value: energy, color:'bg-blue-400' },
+          { label:'Focus', value: focus, color:'bg-indigo-400' },
+          { label:'Stress', value: stress, color:'bg-emerald-400' }
+        ]);
+        return; // success path
+      }
+    } catch {/* ignore and fallback */}
+
+    // Fallback: build a basic trend from recent mood entries directly (client-side)
+    try {
+      const recent = await fetchRecentMoodEntries(userId, 14);
+      if(recent.length){
+        const days = recent.map(r=> new Date(r.created_at).toISOString().slice(0,10));
+        const mood = recent.map(r=> r.mood);
+        const sleep = recent.map(r=> (r.sleep_hours ?? 0));
+        const health = mood.map((m,i)=> (m/10 + (sleep[i] ? Math.min(sleep[i]/8,1) : 0))/2 * 10); // naive composite
+        setTrend({ days, mood, sleep, health });
+        const latestMood = mood.slice(-1)[0];
+        const focus = Math.round((latestMood/10)*100);
+        const stress = Math.max(0, 100-focus);
+        setIndicators([
+          { label:'Energy', value: Math.round((health.slice(-1)[0]||0)*6), color:'bg-blue-400' },
+          { label:'Focus', value: focus, color:'bg-indigo-400' },
+          { label:'Stress', value: stress, color:'bg-emerald-400' }
+        ]);
+        setStatCards(prev => prev.length ? prev : [
+          { title: 'Mood Score', value: `${(latestMood||0).toFixed(1)}/10`, delta: '+0', helper: 'recent', trend:'flat', icon: HeartPulse, accent:'from-sky-500/80 via-blue-500/30' },
+          { title: 'Sleep Quality', value: sleep.slice(-1)[0] ? `${Math.round((Math.min(sleep.slice(-1)[0],8)/8)*100)}%` : '--', delta:'+0', helper:'7h goal', trend:'flat', icon: Clock, accent:'from-indigo-500/80 via-indigo-500/30' },
+          { title: 'AI Sessions', value: '0', delta:'0', helper:'total', trend:'flat', icon: MessageCircle, accent:'from-fuchsia-500/80 via-purple-500/30' },
+          { title: 'Community Touches', value: '0', delta:'0', helper:'posts', trend:'flat', icon: Users, accent:'from-emerald-500/80 via-emerald-500/30' }
+        ]);
+      }
+    } catch {/* swallow */}
+  }, [userId]);
+
+  const fetchJournal = useCallback(async () => {
+    if(!userId) return;
+    const res = await fetch('/api/journal?limit=5', { headers: { 'x-user-id': userId }});
+    const json = await res.json();
+    if(res.ok) setEntries(json.entries);
+  }, [userId]);
+
+  const loadQuote = useCallback(async (refresh=false) => {
+    setQuoteLoading(true); setQuoteError(null);
+    try {
+      const res = await fetch(`/api/dashboard/quote${refresh?'?refresh=1':''}`, { cache:'no-store' });
+      const data = await res.json();
+      if(!res.ok) throw new Error(data.error || 'Failed to load quote');
+      setDailyQuote(data);
+    } catch(e: unknown){
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      setQuoteError(msg);
+    }
+    finally { setQuoteLoading(false); }
+  }, []);
+
+  useEffect(()=>{ fetchSummary(); fetchJournal(); fetchUpcoming(); refreshSuggestions(); loadQuote(); }, [fetchSummary, fetchJournal, fetchUpcoming, loadQuote]);
+
+  const chartSeries = useMemo(()=>{
+    if(!trend) return [];
+    if(timeframe==='weekly') return trend.days.map((d,i)=>({ label:d.slice(5), mood: trend.mood[i], sleep: trend.sleep[i], health: trend.health[i] }));
+    // monthly: compress into 4 buckets
+    const size = Math.ceil(trend.days.length/4);
+  const buckets: { label: string; mood: number; sleep: number; health: number }[] = [];
+    for(let b=0;b<4;b++){
+      const start = b*size; const slice = trend.mood.slice(start,start+size);
+      if(slice.length===0) break;
+      const avg = (arr:number[])=> arr.reduce((a,c)=>a+c,0)/(arr.length||1);
+      buckets.push({ label:`W${b+1}`, mood: avg(trend.mood.slice(start,start+size)), sleep: avg(trend.sleep.slice(start,start+size)), health: avg(trend.health.slice(start,start+size)) });
+    }
+    return buckets;
+  }, [trend, timeframe]);
+
+  // Latest vitals derived for inline snapshot in trends section
+  const latestMoodScore = useMemo(() => trend ? trend.mood.slice(-1)[0] ?? null : null, [trend]);
+  const latestSleepHours = useMemo(() => {
+    if (trend) return trend.sleep.slice(-1)[0] ?? null;
+    return sleepHoursLatest;
+  }, [trend, sleepHoursLatest]);
 
   const moodHeadline = useMemo(() => {
     switch (selectedMood) {
@@ -202,12 +292,18 @@ export default function DashboardPage() {
     return () => window.clearTimeout(timeout);
   }, [journalSaved]);
 
-  const handleSaveEntry = () => {
+  const handleSaveEntry = async () => {
     const trimmed = journalEntry.trim();
-    if (!trimmed) return;
-    setEntries((prev) => [trimmed, ...prev.slice(0, 3)]);
-    setJournalEntry("");
-    setJournalSaved(true);
+    if (!trimmed || !userId) return;
+    const payload: Record<string, unknown> = { entry: trimmed };
+    if(journalTopic.trim()) payload.topic = journalTopic.trim();
+    const res = await fetch('/api/journal', { method:'POST', headers:{ 'Content-Type':'application/json', 'x-user-id': userId }, body: JSON.stringify(payload) });
+    if(res.ok){
+      setJournalEntry('');
+      setJournalTopic('');
+      setJournalSaved(true);
+      fetchJournal();
+    }
   };
 
   const toggleTask = (taskId: string) => {
@@ -219,7 +315,54 @@ export default function DashboardPage() {
   };
 
   const currentMood = moodOptions.find((m) => m.value === selectedMood)?.label;
-  const lastJournal = entries.length > 0 ? "Today" : "None yet";
+  const lastJournal = entries.length > 0 ? new Date(entries[0].created_at).toLocaleDateString(undefined,{month:'short',day:'numeric'}) : "None yet";
+
+  const heartbeat = async () => {
+    if(!userId) return;
+    await fetch('/api/activity/heartbeat', { method:'POST', headers:{'Content-Type':'application/json','x-user-id':userId}, body: JSON.stringify({}) });
+    fetchSummary();
+    refreshSuggestions();
+  };
+
+  // Submit combined health check (mood + optional sleep)
+  const submitHealthCheck = async () => {
+    if(!userId) return;
+    setSubmittingHealth(true);
+    try {
+      const moodScore = mapMoodToScore(selectedMood);
+      const sleepVal = sleepInput ? parseFloat(sleepInput) : undefined;
+      const body: Record<string, unknown> = { mood: moodScore };
+      if(!isNaN(Number(sleepVal))) body.sleep_hours = sleepVal;
+      const res = await fetch('/api/health-check', { method:'POST', headers:{'Content-Type':'application/json','x-user-id':userId}, body: JSON.stringify(body) });
+      if(res.ok){
+        setHealthStep(1);
+        setSleepInput('');
+        // After successful submission, refresh summary or fallback direct fetch to update chart quickly.
+        fetchSummary();
+        // Additionally try a direct incremental append for faster UI without waiting network race (optimistic update)
+        setTrend(prev => {
+          if(!prev) return prev;
+          const today = new Date().toISOString().slice(0,10);
+            const lastDay = prev.days.slice(-1)[0];
+            const moodArr = [...prev.mood];
+            const sleepArr = [...prev.sleep];
+            const healthArr = [...prev.health];
+            if(lastDay === today){
+              moodArr[moodArr.length-1] = moodScore;
+              if(!isNaN(Number(sleepVal))) sleepArr[sleepArr.length-1] = sleepVal || 0;
+              healthArr[healthArr.length-1] = (moodArr[moodArr.length-1]/10 + (sleepArr[sleepArr.length-1] ? Math.min(sleepArr[sleepArr.length-1]/8,1):0))/2 * 10;
+              return { ...prev, mood: moodArr, sleep: sleepArr, health: healthArr };
+            }
+            return {
+              days: [...prev.days, today],
+              mood: [...moodArr, moodScore],
+              sleep: [...sleepArr, !isNaN(Number(sleepVal)) ? sleepVal || 0 : 0],
+              health: [...healthArr, (moodScore/10 + (!isNaN(Number(sleepVal)) ? Math.min((sleepVal||0)/8,1):0))/2 * 10]
+            };
+        });
+      }
+    } finally { setSubmittingHealth(false); }
+  };
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 pb-24">
@@ -237,7 +380,7 @@ export default function DashboardPage() {
             </div>
             <div className="space-y-3">
               <h1 className="text-4xl font-semibold tracking-tight md:text-5xl">
-                Welcome back, Moses R!
+                {`Welcome back, ${friendlyName}!`}
               </h1>
               <p className="max-w-2xl text-base leading-relaxed text-slate-100/85">
                 Your personalized care loop is synced. Keep logging moods and
@@ -252,7 +395,7 @@ export default function DashboardPage() {
               />
               <SummaryChip
                 title="Streak"
-                value="0 days"
+                value={streak ? `${streak} day${streak===1?'':'s'}` : '0 days'}
                 icon={<ShieldCheck className="h-4 w-4" />}
               />
               <SummaryChip
@@ -274,6 +417,13 @@ export default function DashboardPage() {
               >
                 Explore calming routines
               </Link>
+              <button
+                type="button"
+                onClick={heartbeat}
+                className="inline-flex items-center gap-2 rounded-full border border-blue-400/40 bg-blue-500/20 px-5 py-2 text-sm font-semibold text-blue-100 shadow shadow-blue-500/20 transition hover:-translate-y-0.5 hover:bg-blue-500/30"
+              >
+                Refresh <RefreshCw className="h-4 w-4" />
+              </button>
             </div>
           </div>
         </article>
@@ -290,42 +440,55 @@ export default function DashboardPage() {
               <CalendarClock className="h-5 w-5 text-blue-200" />
             </header>
             <ul className="mt-6 space-y-4 text-sm text-slate-200">
-              {upcomingSessions.map((session) => (
-                <li
-                  key={session.label}
-                  className="flex items-start gap-3 rounded-2xl border border-white/10 bg-white/5 p-4"
-                >
-                  <span className="mt-0.5 flex h-9 w-9 items-center justify-center rounded-xl bg-blue-500/15 text-blue-200">
-                    <Clock className="h-4 w-4" />
-                  </span>
-                  <div className="space-y-1">
-                    <p className="font-medium text-white">{session.label}</p>
-                    <p className="text-xs text-slate-300">{session.time}</p>
-                    <span className="inline-flex rounded-full bg-white/10 px-2 py-0.5 text-[11px] uppercase tracking-wide text-slate-200">
-                      {session.type}
+              {loadingUpcoming && (
+                <li className="rounded-2xl border border-white/10 bg-white/5 p-4 text-xs text-slate-400">Loading…</li>
+              )}
+              {!loadingUpcoming && upcoming && upcoming.length === 0 && (
+                <li className="rounded-2xl border border-white/10 bg-white/5 p-4 text-xs text-slate-400">No upcoming bookings. <Link href="/booking" className="underline text-slate-200">Book one</Link>.</li>
+              )}
+              {!loadingUpcoming && upcoming && upcoming.length > 0 && upcoming.map(b => {
+                const d = new Date(b.date + 'T' + b.slot + ':00');
+                const label = b.therapistName ? `Session with ${b.therapistName}` : (b.sessionType || 'Therapist Session');
+                const timeFmt = d.toLocaleDateString(undefined,{ weekday:'short'}) + ' • ' + d.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+                return (
+                  <li key={b.id} className="flex items-start gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">
+                    <span className="mt-0.5 flex h-9 w-9 items-center justify-center rounded-xl bg-blue-500/15 text-blue-200">
+                      <Clock className="h-4 w-4" />
                     </span>
-                  </div>
-                </li>
-              ))}
+                    <div className="space-y-1">
+                      <p className="font-medium text-white">{label}</p>
+                      <p className="text-xs text-slate-300">{timeFmt}</p>
+                      <span className="inline-flex rounded-full bg-white/10 px-2 py-0.5 text-[11px] uppercase tracking-wide text-slate-200">{b.sessionType || 'Scheduled'}</span>
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
           </article>
 
           <article className="rounded-3xl border border-white/5 bg-gradient-to-br from-indigo-500/20 via-indigo-500/10 to-transparent p-6 shadow-xl shadow-indigo-500/20">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs uppercase tracking-[0.4em] text-indigo-200">
-                  Quote of the Day
-                </p>
-                <p className="mt-3 text-base text-indigo-50">
-                  &ldquo;Balance is not perfection, it&apos;s about progress.&rdquo;
-                </p>
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <p className="text-xs uppercase tracking-[0.4em] text-indigo-200">Quote of the Day</p>
+                {quoteError && <p className="mt-3 text-xs text-rose-200">{quoteError}</p>}
+                {!quoteError && !dailyQuote && (
+                  <p className="mt-3 text-sm text-indigo-100 flex items-center gap-2"><RefreshCw className="h-4 w-4 animate-spin" /> Loading...</p>
+                )}
+                {dailyQuote && !quoteError && (
+                  <div className="mt-3 space-y-2">
+                    <p className="text-base text-indigo-50 leading-relaxed">&ldquo;{dailyQuote.quote}&rdquo;</p>
+                    <p className="text-xs text-indigo-200">— {dailyQuote.author || 'Unknown'} {dailyQuote.cached && <span className="ml-2 rounded-full bg-white/10 px-2 py-0.5 text-[10px] uppercase tracking-wide">cached</span>} {dailyQuote.regenerated && <span className="ml-2 rounded-full bg-amber-400/20 px-2 py-0.5 text-[10px] uppercase tracking-wide text-amber-200">new</span>}</p>
+                  </div>
+                )}
               </div>
               <button
                 type="button"
-                className="rounded-full border border-white/20 bg-white/10 p-2 text-indigo-100 transition hover:border-white/40"
+                onClick={()=>loadQuote(true)}
+                disabled={quoteLoading}
+                className="rounded-full border border-white/20 bg-white/10 p-2 text-indigo-100 transition hover:border-white/40 disabled:opacity-50"
                 aria-label="Refresh quote"
               >
-                <RefreshCw className="h-4 w-4" />
+                <RefreshCw className={quoteLoading?"h-4 w-4 animate-spin":"h-4 w-4"} />
               </button>
             </div>
           </article>
@@ -450,45 +613,111 @@ export default function DashboardPage() {
               </LineChart>
             </ResponsiveContainer>
           </div>
+          {/* Integrated Core Vitals Snapshot */}
+          <div className="mt-10 grid gap-8 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1fr)]">
+            <div className="space-y-5 rounded-2xl border border-white/10 bg-white/5 p-5">
+              <h3 className="text-xs font-semibold uppercase tracking-[0.35em] text-slate-400">Vitals snapshot</h3>
+              <div className="grid grid-cols-2 gap-4 text-sm">
+                <div className="rounded-xl border border-white/10 bg-slate-950/30 p-4">
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-slate-400">Latest mood</p>
+                  <p className="mt-2 text-xl font-semibold text-sky-200">{latestMoodScore != null ? latestMoodScore.toFixed(1) : '--'}</p>
+                </div>
+                <div className="rounded-xl border border-white/10 bg-slate-950/30 p-4">
+                  <p className="text-[10px] uppercase tracking-[0.3em] text-slate-400">Sleep (hrs)</p>
+                  <p className="mt-2 text-xl font-semibold text-emerald-200">{latestSleepHours != null ? Number(latestSleepHours).toFixed(1) : '--'}</p>
+                </div>
+              </div>
+              <p className="text-[11px] leading-relaxed text-slate-400">These reflect your most recent check-ins. Keep consistency for more accurate trend modeling.</p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
+              <h3 className="text-xs font-semibold uppercase tracking-[0.35em] text-slate-400">Core vitals</h3>
+              {indicators.length === 0 ? (
+                <p className="mt-4 text-xs text-slate-400">No data yet. Log a Health Check to begin.</p>
+              ) : (
+                <ul className="mt-5 space-y-4 text-sm text-slate-200">
+                  {indicators.map(ind => (
+                    <li key={ind.label}>
+                      <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.35em] text-slate-400">
+                        <span>{ind.label}</span>
+                        <span>{ind.value}%</span>
+                      </div>
+                      <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/5">
+                        <div className={classNames('h-full rounded-full', ind.color)} style={{ width: `${ind.value}%` }} />
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
         </article>
 
         <article className="rounded-3xl border border-white/5 bg-slate-900/70 p-8 shadow-xl shadow-indigo-500/10 backdrop-blur-xl">
           <header>
-            <h2 className="text-lg font-semibold text-white">Mood pulse</h2>
+            <h2 className="text-lg font-semibold text-white">Health Check</h2>
             <p className="mt-1 text-sm text-slate-400">
-              Choose the option that feels closest right now.
+              {healthStep === 1 ? 'Step 1: Select your current mood.' : 'Step 2: Enter last night\'s sleep (hours).'}
             </p>
           </header>
-          <div className="mt-6 grid gap-3">
-            {moodOptions.map((mood) => {
-              const isActive = selectedMood === mood.value;
-              return (
+          {healthStep === 1 && (
+            <div className="mt-6 grid gap-3">
+              {moodOptions.map((mood) => {
+                const isActive = selectedMood === mood.value;
+                return (
+                  <button
+                    key={mood.value}
+                    type="button"
+                    onClick={() => { setSelectedMood(mood.value); setHealthStep(2); }}
+                    className={classNames(
+                      "flex items-center justify-between rounded-2xl border px-5 py-3 text-left transition",
+                      isActive
+                        ? "border-blue-500/70 bg-blue-500/25 text-white shadow-lg shadow-blue-500/20"
+                        : "border-white/10 bg-white/5 text-slate-200 hover:border-white/25 hover:bg-white/10"
+                    )}
+                  >
+                    <span className="text-lg font-medium">{mood.label}</span>
+                    <span className="text-2xl">{mood.emoji}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {healthStep === 2 && (
+            <div className="mt-6 space-y-4">
+              <label className="block text-sm font-medium text-slate-200">Sleep hours</label>
+              <div className="flex items-center gap-3">
+                <div className="relative flex-1">
+                  <Moon className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="number"
+                    step="0.5"
+                    min="0"
+                    max="24"
+                    value={sleepInput}
+                    onChange={e=>setSleepInput(e.target.value)}
+                    placeholder={sleepHoursLatest != null ? `${sleepHoursLatest}` : '7.5'}
+                    className="w-full rounded-2xl border border-white/10 bg-white/5 py-3 pl-10 pr-4 text-sm text-white outline-none transition focus:border-blue-400 focus:ring-4 focus:ring-blue-400/30"
+                  />
+                </div>
                 <button
-                  key={mood.value}
                   type="button"
-                  onClick={() => setSelectedMood(mood.value)}
-                  className={classNames(
-                    "flex items-center justify-between rounded-2xl border px-5 py-3 text-left transition",
-                    isActive
-                      ? "border-blue-500/70 bg-blue-500/25 text-white shadow-lg shadow-blue-500/20"
-                      : "border-white/10 bg-white/5 text-slate-200 hover:border-white/25 hover:bg-white/10"
-                  )}
+                  disabled={submittingHealth}
+                  onClick={submitHealthCheck}
+                  className="inline-flex items-center gap-2 rounded-2xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white shadow shadow-blue-500/25 transition hover:bg-blue-500 disabled:opacity-50"
                 >
-                  <span className="text-lg font-medium">{mood.label}</span>
-                  <span className="text-2xl">{mood.emoji}</span>
+                  {submittingHealth ? 'Saving...' : 'Submit'} <ChevronRight className="h-4 w-4" />
                 </button>
-              );
-            })}
-          </div>
+              </div>
+              <button type="button" onClick={()=>{ setHealthStep(1); }} className="text-xs text-slate-400 underline">Change mood</button>
+            </div>
+          )}
           <p className="mt-5 text-sm text-slate-300">{moodHeadline}</p>
+          {sleepHoursLatest != null && (
+            <p className="mt-2 text-xs text-slate-400">Last logged sleep: {sleepHoursLatest}h</p>
+          )}
           <div className="mt-6 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-200">
-            <h3 className="text-xs uppercase tracking-[0.3em] text-slate-400">
-              Suggested next step
-            </h3>
-            <p className="mt-3 text-slate-200">
-              Try a guided breath from the AI Companion or write a quick thought
-              in the journal to capture the moment.
-            </p>
+            <h3 className="text-xs uppercase tracking-[0.3em] text-slate-400">Suggested next step</h3>
+            <p className="mt-3 text-slate-200">Try a guided breath from the AI Companion or write a quick thought in the journal to capture the moment.</p>
           </div>
         </article>
       </section>
@@ -504,12 +733,28 @@ export default function DashboardPage() {
             </div>
             <NotebookPen className="h-5 w-5 text-rose-300" />
           </header>
-          <textarea
+          <div className="mt-6 grid gap-3 sm:grid-cols-[160px_1fr]">
+            <div className="flex flex-col gap-2">
+              <input
+                value={journalTopic}
+                onChange={e=>setJournalTopic(e.target.value)}
+                maxLength={120}
+                placeholder="Topic (optional)"
+                className="h-10 w-full rounded-2xl border border-white/10 bg-white/5 px-4 text-sm text-white outline-none transition focus:border-rose-400 focus:ring-4 focus:ring-rose-400/30"
+              />
+              <button
+                type="button"
+                onClick={()=>{ if(!userId) return; window.location.href = '/journal'; }}
+                className="h-10 rounded-2xl border border-white/10 bg-white/5 text-xs font-semibold uppercase tracking-[0.25em] text-slate-300 transition hover:border-white/25 hover:bg-white/10"
+              >View journal</button>
+            </div>
+            <textarea
             value={journalEntry}
             onChange={(event) => setJournalEntry(event.target.value)}
             placeholder="Write down your thoughts and feelings..."
             className="mt-6 h-32 w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white outline-none transition focus:border-blue-400 focus:ring-4 focus:ring-blue-400/30"
           />
+          </div>
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <button
               type="button"
@@ -532,12 +777,10 @@ export default function DashboardPage() {
               <p className="text-sm text-slate-300">No recent entries yet.</p>
             ) : (
               <ul className="space-y-3">
-                {entries.map((entry, index) => (
-                  <li
-                    key={index}
-                    className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-200"
-                  >
-                    {entry}
+                {entries.map(e => (
+                  <li key={e.id} className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-200">
+                    {e.entry}
+                    <span className="mt-2 block text-[10px] uppercase tracking-[0.3em] text-slate-400">{new Date(e.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                   </li>
                 ))}
               </ul>
@@ -550,11 +793,11 @@ export default function DashboardPage() {
             <header className="flex items-center justify-between">
               <div>
                 <h2 className="text-lg font-semibold text-white">Daily focus</h2>
-                <p className="mt-1 text-sm text-slate-400">
-                  Pick small resets to keep your streak alive.
-                </p>
+                <p className="mt-1 text-sm text-slate-400">Pick small resets to keep your streak alive.</p>
               </div>
-              <CheckCircle2 className="h-5 w-5 text-emerald-300" />
+              <button type="button" onClick={fetchDailyFocus} className="rounded-full border border-white/10 bg-white/5 p-2 text-slate-200 hover:border-white/30 hover:bg-white/10" aria-label="Refresh tasks">
+                {loadingFocus ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              </button>
             </header>
             <ul className="mt-6 space-y-3">
               {focusTasks.map((task) => {
@@ -587,34 +830,6 @@ export default function DashboardPage() {
                   </li>
                 );
               })}
-            </ul>
-          </div>
-
-          <div className="rounded-3xl border border-white/5 bg-slate-900/70 p-8 shadow-xl shadow-indigo-500/10 backdrop-blur-xl">
-            <header className="flex items-center justify-between">
-              <div>
-                <h2 className="text-lg font-semibold text-white">Core vitals</h2>
-                <p className="mt-1 text-sm text-slate-400">
-                  Snapshot from your latest check-ins.
-                </p>
-              </div>
-              <Activity className="h-5 w-5 text-emerald-300" />
-            </header>
-            <ul className="mt-6 space-y-4 text-sm text-slate-200">
-              {healthIndicators.map((indicator) => (
-                <li key={indicator.label}>
-                  <div className="flex items-center justify-between text-xs uppercase tracking-[0.35em] text-slate-400">
-                    <span>{indicator.label}</span>
-                    <span>{indicator.value}%</span>
-                  </div>
-                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/5">
-                    <div
-                      className={classNames("h-full rounded-full", indicator.color)}
-                      style={{ width: `${indicator.value}%` }}
-                    />
-                  </div>
-                </li>
-              ))}
             </ul>
           </div>
         </article>
