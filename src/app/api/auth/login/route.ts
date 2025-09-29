@@ -23,72 +23,78 @@ export async function POST(req: NextRequest) {
   try {
     const { identifier, password, role } = await req.json();
     if (!identifier || !password) {
-      return new Response(JSON.stringify({ error: 'identifier and password required'}), { status: 400 });
+      return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 400 });
     }
-    const desiredRole = role === 'admin' ? 'admin' : 'user';
+    // Explicit mode selection (defaults to user). We do *not* elevate a normal user profile to admin automatically.
+    const desiredRole: 'admin' | 'user' = role === 'admin' ? 'admin' : 'user';
     const supabase = getSupabaseAdmin();
   let profile: any = null;
   interface AdminRow { id: string; username: string; email?: string | null; password_hash: string; created_at?: string }
-  interface UserRow { user_id: string; username: string | null; display_name: string | null; role?: string | null; hashed_password?: string | null }
+  interface UserRow { user_id: string; username: string | null; display_name: string | null; role?: string | null; hashed_password?: string | null; email?: string | null }
 
     const looksLikeEmail = identifier.includes('@');
 
     if (desiredRole === 'admin') {
-      // Try username OR email (two queries, prefer username hit first for speed)
-      let adminRow: AdminRow | null = null;
-      if (!looksLikeEmail) {
-        const { data, error } = await supabase
-          .from('admin_accounts')
-          .select('id,username,email,password_hash')
-          .ilike('username', identifier)
-          .maybeSingle();
-        if (error && error.code !== 'PGRST116') throw error; // ignore no rows
-        adminRow = data as AdminRow | null;
-      }
+      // Admin mode: look only in admin_accounts. Avoid timing difference leaks by performing both lookups.
+      const fetchByUsername = !looksLikeEmail ? supabase
+        .from('admin_accounts')
+        .select('id,username,email,password_hash')
+        .ilike('username', identifier)
+        .maybeSingle() : Promise.resolve({ data: null, error: null });
+      const fetchByEmail = supabase
+        .from('admin_accounts')
+        .select('id,username,email,password_hash')
+        .ilike('email', identifier)
+        .maybeSingle();
+      const [userAttempt, emailAttempt] = await Promise.all([fetchByUsername, fetchByEmail]);
+      if (userAttempt.error && userAttempt.error.code !== 'PGRST116') throw userAttempt.error;
+      if (emailAttempt.error && emailAttempt.error.code !== 'PGRST116') throw emailAttempt.error;
+      const adminRow = (userAttempt.data as AdminRow | null) || (emailAttempt.data as AdminRow | null);
       if (!adminRow) {
-        const { data, error } = await supabase
-          .from('admin_accounts')
-            .select('id,username,email,password_hash')
-            .ilike('email', identifier)
-            .maybeSingle();
-        if (error && error.code !== 'PGRST116') throw error;
-        adminRow = adminRow || (data as AdminRow | null);
+        return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
       }
-      if (adminRow) {
-        const valid = await bcrypt.compare(password, adminRow.password_hash);
-        if (!valid) return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
-        profile = { user_id: adminRow.id, username: adminRow.username, display_name: adminRow.username, role: 'admin' };
-      }
+      const valid = await bcrypt.compare(password, adminRow.password_hash);
+      if (!valid) return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
+      profile = { user_id: adminRow.id, username: adminRow.username, display_name: adminRow.username, role: 'admin' };
     } else {
       let userRow: UserRow | null = null;
       if (!looksLikeEmail) {
         const { data, error } = await supabase
           .from('user_profiles')
-          .select('user_id,username,display_name,role,hashed_password')
+          .select('user_id,username,display_name,role,hashed_password,email')
           .ilike('username', identifier)
           .maybeSingle();
         if (error && error.code !== 'PGRST116') throw error;
         userRow = data as UserRow | null;
       }
       if (!userRow && looksLikeEmail) {
-        // Heuristic: try to match email's local-part to username (since user_profiles does not store email directly)
-        const localPart = identifier.split('@')[0];
+        // Now user_profiles has an email column, prefer direct match
         const { data, error } = await supabase
           .from('user_profiles')
-          .select('user_id,username,display_name,role,hashed_password')
-          .ilike('username', localPart)
+          .select('user_id,username,display_name,role,hashed_password,email')
+          .ilike('email', identifier)
           .maybeSingle();
         if (error && error.code !== 'PGRST116') throw error;
         userRow = userRow || (data as UserRow | null);
       }
-      if (userRow) {
-        if (!userRow.hashed_password) {
-          return new Response(JSON.stringify({ error: 'Account not configured for password login'}), { status: 401 });
-        }
+      if (!userRow) {
+        return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
+      }
+      if (userRow.hashed_password) {
         const valid = await bcrypt.compare(password, userRow.hashed_password);
         if (!valid) return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
-        const uid = userRow.user_id;
-        profile = { user_id: uid, username: userRow.username, display_name: userRow.display_name, role: userRow.role || 'user' };
+        profile = { user_id: userRow.user_id, username: userRow.username, display_name: userRow.display_name, role: userRow.role || 'user' };
+      } else if (looksLikeEmail) {
+        // Legacy fallback via Supabase auth
+        try {
+          const { data: authUser, error: authErr } = await (supabase.auth as any).signInWithPassword({ email: identifier, password });
+          if (authErr || !authUser?.user) return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
+          profile = { user_id: authUser.user.id, username: userRow.username, display_name: userRow.display_name, role: userRow.role || 'user' };
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
+        }
+      } else {
+        return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
       }
     }
     if (!profile) return new Response(JSON.stringify({ error: 'Invalid credentials'}), { status: 401 });
@@ -112,8 +118,8 @@ export async function POST(req: NextRequest) {
   });
 
   return new Response(JSON.stringify({ user: userPayload }), { status: 200 });
-  } catch (e) {
-    const err = e as Error;
-    return new Response(JSON.stringify({ error: err.message || 'error'}), { status: 500 });
+  } catch {
+    // Avoid exposing internal details; log server-side if needed.
+    return new Response(JSON.stringify({ error: 'Unable to process login'}), { status: 500 });
   }
 }

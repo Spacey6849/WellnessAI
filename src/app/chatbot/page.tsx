@@ -1,6 +1,9 @@
 "use client";
 
 import { useState, useRef, useEffect, useMemo } from "react";
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { useSession } from '@/lib/useSession';
 import Image from "next/image";
 import {
   MessageSquareText,
@@ -75,6 +78,15 @@ function createAudioContext(): AudioContext {
 
 export default function ChatbotPage() {
   const [mode, setMode] = useState<Mode>("chat");
+  // Model selection for local LLM (Ollama) - default blank means use server logic
+  const [ollamaModel, setOllamaModel] = useState<string>("");
+  const availableLocalModels = [
+    { value: "", label: "Auto (env / fallback)" },
+    { value: "gemma:2b", label: "Gemma 2B" },
+    { value: "gemma:7b", label: "Gemma 7B" },
+    { value: "llama3.2", label: "Llama 3.2" },
+    { value: "mistral", label: "Mistral" },
+  ];
   const [sttEngine] = useState<"browser" | "agent">("browser"); // default to browser STT
   // We'll fetch existing sessions from the API; if none exist we'll create one.
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -109,37 +121,86 @@ export default function ChatbotPage() {
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const listRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const userName = "Maya"; // could come from auth context later
-  const userId = "demo-user"; // TEMP: until real auth, used for Authorization header (maps to RLS user_id)
+  // Pull name/id from unified session hook. Use state to avoid hydration issues with localStorage.
+  const { session } = useSession();
+  const [anonymousId, setAnonymousId] = useState<string>('');
+  const userName = session?.user?.name || 'Guest';
+  const userId = session?.user?.id || anonymousId;
+  
+  // Ensure we have a persistent anon id for non-authenticated users
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!session?.user?.id) {
+      // Only set anonymous ID if no authenticated session
+      let existing = localStorage.getItem('wellnessai_mock_uid');
+      if (!existing) {
+        existing = crypto.randomUUID();
+        localStorage.setItem('wellnessai_mock_uid', existing);
+      }
+      setAnonymousId(existing);
+    }
+  }, [session?.user?.id]);
 
   // Load sessions on mount
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
+        // Wait for userId to be available (either from session or anonymous ID)
+        if (!userId) {
+          // If we don't have userId yet, create a local conversation immediately
+          const localId = crypto.randomUUID();
+          setConversations([{ id: localId, title: 'New Conversation', createdAt: Date.now(), messages: [], hasLoaded: true }]);
+          setActiveId(localId);
+          return;
+        }
+        // Only attempt remote session load if we have a session user (not anonymous)
+        if (!session?.user?.id) throw new Error('no-authenticated-user');
         const res = await fetch('/api/chat/sessions', { headers: { Authorization: `Bearer ${userId}` } });
-        if (!res.ok) throw new Error('Failed to load sessions');
+        if (!res.ok) {
+          console.warn('Sessions endpoint unavailable or unauthorized; using local-only conversation.');
+          throw new Error(`sessions-fetch-failed:${res.status}`);
+        }
         const json = await res.json();
         const sessions: { id: string; title: string; created_at: string; updated_at: string }[] = json.sessions || [];
         if (cancelled) return;
         if (sessions.length === 0) {
-          // Create an initial session
+          try {
             const create = await fetch('/api/chat/sessions', { method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${userId}` }, body: JSON.stringify({ title: 'New Conversation' }) });
             const created = await create.json();
             if (create.ok && created.session) {
               setConversations([{ id: created.session.id, title: created.session.title, createdAt: Date.parse(created.session.created_at), messages: [], hasLoaded: true }]);
               setActiveId(created.session.id);
+              return;
             }
-            return;
+          } catch (e) {
+            console.warn('Auto-create remote session failed, fallback to local only.', e);
+          }
+          // Fallback local-only session (non-persistent)
+          const localId = crypto.randomUUID();
+          setConversations([{ id: localId, title: 'New Conversation', createdAt: Date.now(), messages: [], hasLoaded: true }]);
+          setActiveId(localId);
+          return;
         }
         const mapped: Conversation[] = sessions.map(s => ({ id: s.id, title: s.title || 'Untitled', createdAt: Date.parse(s.created_at), messages: [], hasLoaded: false }));
         setConversations(mapped);
         setActiveId(prev => prev || mapped[0]?.id || "");
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        if (!cancelled) {
+          // Fallback local conversation when remote list fails entirely
+          const localId = crypto.randomUUID();
+          setConversations([{ id: localId, title: 'New Conversation', createdAt: Date.now(), messages: [], hasLoaded: true }]);
+          setActiveId(localId);
+        }
+        const errorMsg = (e as Error)?.message || '';
+        if (!errorMsg.startsWith('no-user-id') && !errorMsg.startsWith('no-authenticated-user')) {
+          console.warn('Session load fallback', e);
+        }
+      }
     };
     load();
     return () => { cancelled = true; };
-  }, []);
+  }, [userId, session?.user?.id]);
 
   // Load messages lazily when a conversation becomes active and hasn't been loaded yet
   useEffect(() => {
@@ -154,10 +215,14 @@ export default function ChatbotPage() {
         const msgs: { id: string; role: string; content: string; created_at: string }[] = json.messages || [];
         if (cancelled) return;
         setConversations(prev => prev.map(c => c.id === activeId ? { ...c, messages: msgs.map(m => ({ id: m.id, role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })), hasLoaded: true } : c));
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        // Swallow message load errors; keep session usable locally
+        if (!cancelled) setConversations(prev => prev.map(c => c.id === activeId ? { ...c, hasLoaded: true } : c));
+        console.error('Message load error', e);
+      }
     })();
     return () => { cancelled = true; };
-  }, [activeId, conversations]);
+  }, [activeId, conversations, userId]);
 
   // Deterministic initial suggestions (avoid random during SSR hydration)
   useEffect(() => {
@@ -205,10 +270,13 @@ export default function ChatbotPage() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ messages: [...messages, userMsg] }),
+        body: JSON.stringify({
+          messages: [...messages, userMsg],
+          ...(ollamaModel ? { model: ollamaModel } : {})
+        }),
       });
-      const data = await res.json();
-      const aiText = data?.content || "Sorry, I couldn't generate a response.";
+  const data = await res.json();
+  const aiText = data?.content || "Sorry, I couldn't generate a response.";
 
       // Append assistant message
       setConversations((prev) => prev.map((c) => c.id === activeId ? {
@@ -270,9 +338,17 @@ export default function ChatbotPage() {
   };
 
   // Speech capture: prefer Browser STT. Agent WS path only when selected.
+  // NOTE: Do NOT include agentStatus in deps; it causes re-runs (connecting->connected) that
+  // re-invoke getUserMedia and leak an extra active mic stream. That was causing the mic
+  // permission indicator to stay on after toggling off. We manage agentStatus internally.
   useEffect(() => {
+    let starting = false; // reentrancy guard
     const start = async () => {
+      if (starting) return; // prevent overlapping starts
       if (!recording || mode !== "speech") return;
+      starting = true;
+      // Defensive: if a previous stream/recognition somehow exists, fully stop it first.
+      stop(true);
   if (sttEngine === 'browser') {
         // Browser STT via Web Speech API
         setStreamingText("");
@@ -300,7 +376,27 @@ export default function ChatbotPage() {
           const combined = (finalText + (interim ? ' ' + interim : '')).trim();
           setStreamingText(combined);
         };
-        rec.onerror = (e) => { console.error('STT error', e); setAgentStatus('error'); };
+        rec.onerror = (e) => {
+          // Web Speech API fires generic errors (network/no-speech/audio-capture). Some are transient.
+          try {
+            // e is typically a SpeechRecognitionErrorEvent, but not typed here.
+            // We extract a probable error type/message string for classification.
+            // @ts-expect-error - runtime property access
+            const errType: string | undefined = e?.error || e?.type;
+            // @ts-expect-error - runtime property access
+            const msg: string | undefined = e?.message;
+            const label = errType || msg || 'unknown';
+            const benign = ['no-speech','aborted','audio-capture','network'];
+            if (benign.includes(label)) {
+              console.warn('STT transient issue:', label, e);
+              // For benign cases we keep status connected so user can toggle off/on.
+              // Optionally could auto-restart; we leave it manual to avoid loops.
+              return;
+            }
+            console.error('STT fatal error:', label, e);
+          } catch { console.error('STT error', e); }
+          setAgentStatus('error');
+        };
         rec.onend = () => { /* will finalize on toggle */ };
         try { rec.start(); } catch {}
 
@@ -483,7 +579,7 @@ export default function ChatbotPage() {
       }
     };
 
-    const stop = () => {
+    const stop = (suppressStatusReset = false) => {
       try { processorRef.current?.disconnect(); } catch {}
       try { sourceNodeRef.current?.disconnect(); } catch {}
       try { audioCtxRef.current?.close(); } catch {}
@@ -506,19 +602,19 @@ export default function ChatbotPage() {
         wsRef.current = null;
       }
       levelRef.current = 0; setMicLevel(0);
-      setAgentStatus('idle');
+      if (!suppressStatusReset) setAgentStatus('idle');
     };
 
     if (recording && mode === 'speech') start(); else stop();
     return () => stop();
-  }, [recording, mode, sttEngine, agentStatus]);
+  }, [recording, mode, sttEngine]);
 
   // Commit recognized speech as a user message, ask Gemini, then speak via TTS
   const finalizeStreaming = async () => {
     if (finalizeLockRef.current) return;
     finalizeLockRef.current = true;
     const text = streamingText.trim();
-    if (!text) return;
+    if (!text) { finalizeLockRef.current = false; return; }
     const userMsg: ChatMessage = { id: crypto.randomUUID(), role: "user", content: text };
     setStreamingText("");
     setConversations((prev) => prev.map((c) => c.id === activeId ? {
@@ -528,10 +624,12 @@ export default function ChatbotPage() {
     } : c));
 
     try {
+  const payload: { messages: ChatMessage[]; model?: string } = { messages: [...messages, userMsg] };
+      if (ollamaModel) payload.model = ollamaModel; // include selected local model
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ messages: [...messages, userMsg] }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       const aiText = data?.content || "Sorry, I couldn't generate a response.";
@@ -559,6 +657,14 @@ export default function ChatbotPage() {
     }
     finalizeLockRef.current = false;
   };
+
+  // Ensure no phantom recognition restarts when component unmounts or mode switches
+  useEffect(() => {
+    return () => {
+      try { recognitionRef.current?.stop?.(); } catch {}
+      try { recognitionRef.current?.abort?.(); } catch {}
+    };
+  }, []);
 
   const stopSpeaking = () => {
     try {
@@ -703,11 +809,33 @@ export default function ChatbotPage() {
     setRecording((r) => {
       if (r) {
         // stopping (finalize text area only for now)
-        finalizeStreaming();
+        // do not auto finalize; allow manual finalize
         return false;
       }
       return true;
     });
+  };
+
+  // Markdown-aware message renderer with optional spoken highlight
+  const MessageContent = ({ m }: { m: ChatMessage }) => {
+    const isSpoken = speakingMsgId === m.id && (isSpeaking || isPaused);
+    if (isSpoken) {
+      const total = m.content.length || 1;
+      const cut = Math.max(1, Math.floor(total * speakingProgress));
+      const spoken = m.content.slice(0, cut);
+      const remain = m.content.slice(cut);
+      return (
+        <span>
+          <span className="bg-gradient-to-r from-emerald-400/40 to-blue-400/20 rounded-sm block">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{spoken}</ReactMarkdown>
+          </span>
+          <span className="opacity-70 block">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{remain}</ReactMarkdown>
+          </span>
+        </span>
+      );
+    }
+    return <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>;
   };
 
   return (
@@ -935,32 +1063,9 @@ export default function ChatbotPage() {
                 <p className="text-center text-sm text-slate-400">Your transcribed guidance will appear here.</p>
               )}
               {messages.map((m) => (
-                <div key={m.id} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-                  <div
-                    className={`max-w-[70%] whitespace-pre-wrap rounded-2xl px-4 py-3 leading-relaxed shadow ${
-                      m.role === "user"
-                        ? "bg-gradient-to-r from-blue-600 to-blue-500 text-white"
-                        : "bg-white/5 text-slate-100 border border-white/10"
-                    }`}
-                  >
-                    {speakingMsgId === m.id && (isSpeaking || isPaused) ? (
-                      (() => {
-                        const total = m.content.length || 1;
-                        const cut = Math.max(1, Math.floor(total * speakingProgress));
-                        const spoken = m.content.slice(0, cut);
-                        const remain = m.content.slice(cut);
-                        return (
-                          <span>
-                            <span className="bg-gradient-to-r from-emerald-400/40 to-blue-400/20 rounded-sm">
-                              {spoken}
-                            </span>
-                            <span className="opacity-70">{remain}</span>
-                          </span>
-                        );
-                      })()
-                    ) : (
-                      m.content
-                    )}
+                <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`prose prose-invert max-w-[70%] whitespace-pre-wrap rounded-2xl px-4 py-3 leading-relaxed shadow ${m.role === 'user' ? 'bg-gradient-to-r from-blue-600 to-blue-500 text-white prose-p:my-2' : 'bg-white/5 text-slate-100 border border-white/10 prose-p:my-2'}`}>
+                    <MessageContent m={m} />
                   </div>
                 </div>
               ))}
@@ -987,6 +1092,25 @@ export default function ChatbotPage() {
             aria-label={mode === "chat" ? "Chat input" : "Speech mode controls"}
           >
             <div className="flex flex-1 flex-col gap-2">
+              {mode === 'chat' && (
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-400">
+                    Local Model
+                  </label>
+                  <select
+                    value={ollamaModel}
+                    onChange={(e) => setOllamaModel(e.target.value)}
+                    className="rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-xs text-slate-200 focus:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-400/30"
+                  >
+                    {availableLocalModels.map(m => (
+                      <option key={m.value} value={m.value}>{m.label}</option>
+                    ))}
+                  </select>
+                  {ollamaModel && (
+                    <span className="text-[10px] text-blue-300/70">Using {ollamaModel}</span>
+                  )}
+                </div>
+              )}
               {mode === "chat" && (
                 <input
                   ref={inputRef}
@@ -998,6 +1122,23 @@ export default function ChatbotPage() {
               )}
               {mode === "speech" && (
                 <div className="flex flex-col gap-3 rounded-xl border border-white/15 bg-black/30 px-4 py-4 text-sm text-slate-200">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <label className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-400">
+                      Local Model
+                    </label>
+                    <select
+                      value={ollamaModel}
+                      onChange={(e) => setOllamaModel(e.target.value)}
+                      className="rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-xs text-slate-200 focus:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-400/30"
+                    >
+                      {availableLocalModels.map(m => (
+                        <option key={m.value} value={m.value}>{m.label}</option>
+                      ))}
+                    </select>
+                    {ollamaModel && (
+                      <span className="text-[10px] text-blue-300/70">Using {ollamaModel}</span>
+                    )}
+                  </div>
                   <div className="flex items-center gap-4">
                     <button
                       type="button"
@@ -1010,11 +1151,20 @@ export default function ChatbotPage() {
                       <Mic className="h-6 w-6" />
                     </button>
                     <div className="flex flex-1 flex-col">
-                      <p className="text-xs uppercase tracking-[0.35em] text-slate-400">{recording ? "Listening" : "Idle"}</p>
+                      <p className="text-xs uppercase tracking-[0.35em] text-slate-400">{recording ? "Listening" : streamingText ? 'Review' : "Idle"}</p>
                       <p className="text-sm text-slate-200">
-                        {recording ? "Speak now…" : "Press the mic to begin recording"}
+                        {recording ? "Speak now…" : streamingText ? 'Press Finalize to send or resume to add more' : "Press the mic to begin recording"}
                       </p>
                     </div>
+                    {!recording && streamingText && (
+                      <button
+                        type="button"
+                        onClick={finalizeStreaming}
+                        className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-blue-600/70 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.25em] text-white transition hover:border-white/30 hover:bg-blue-600"
+                      >
+                        Finalize
+                      </button>
+                    )}
                     {(isSpeaking || isPaused) && (
                       <div className="flex items-center gap-2">
                         <button

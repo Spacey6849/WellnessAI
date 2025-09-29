@@ -13,12 +13,16 @@ interface CreateMeetParams {
   startDate: string; // YYYY-MM-DD
   startTime: string; // HH:MM
   durationMinutes?: number; // default 30
-  attendeeEmail?: string | null;
+  attendeeEmail?: string | null; // backwards compatibility (single)
+  attendeeEmails?: string[]; // preferred multi-attendee list (deduped & filtered)
+  // In future we could allow specifying which attendees are optional / accepted statuses.
+  // For now all provided attendees are auto-marked accepted to minimize Google Meet lobby prompts.
 }
 
 interface CreateMeetResult {
   eventId: string;
   meetUrl: string | null;
+  htmlLink: string | null;
 }
 
 function getEnv(name: string, optional = false) {
@@ -70,9 +74,18 @@ export async function createCalendarEventWithMeet(params: CreateMeetParams): Pro
   const start = new Date(startISO);
   const end = new Date(start.getTime() + durationMinutes * 60000);
   interface EventBody {
-    summary: string; description: string; start: { dateTime: string }; end: { dateTime: string };
+    summary: string;
+    description: string;
+    start: { dateTime: string };
+    end: { dateTime: string };
     conferenceData: { createRequest: { requestId: string; conferenceSolutionKey: { type: string } } };
-    attendees?: { email: string }[];
+    attendees?: { email: string; responseStatus?: string }[];
+    // Guest / access controls: these flags help ensure invited therapist can join smoothly.
+    guestsCanInviteOthers?: boolean;
+    guestsCanModify?: boolean;
+    guestsCanSeeOtherGuests?: boolean;
+    // conferenceProperties could further restrict types; not strictly required here.
+    conferenceProperties?: { allowedConferenceSolutionTypes?: string[] };
   }
   const eventBody: EventBody = {
     summary: params.summary,
@@ -82,11 +95,22 @@ export async function createCalendarEventWithMeet(params: CreateMeetParams): Pro
     conferenceData: {
       createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: 'hangoutsMeet' } }
     },
+    // Default guest permissions: allow seeing other guests so both parties visible; don't allow modifying/inviting.
+    guestsCanInviteOthers: false,
+    guestsCanModify: false,
+    guestsCanSeeOtherGuests: true,
+    conferenceProperties: { allowedConferenceSolutionTypes: ['hangoutsMeet'] }
   };
-  if (params.attendeeEmail) {
-    eventBody.attendees = [{ email: params.attendeeEmail }];
+  const multi = params.attendeeEmails && params.attendeeEmails.length
+    ? params.attendeeEmails
+    : (params.attendeeEmail ? [params.attendeeEmail] : []);
+  if (multi.length) {
+    const unique = Array.from(new Set(multi.filter(e => !!e)));
+    if (unique.length) {
+      eventBody.attendees = unique.map(email => ({ email, responseStatus: 'accepted' }));
+    }
   }
-  const res = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?conferenceDataVersion=1`, {
+  const res = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?conferenceDataVersion=1&sendUpdates=all`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${token}`,
@@ -99,8 +123,8 @@ export async function createCalendarEventWithMeet(params: CreateMeetParams): Pro
     throw new Error(`Calendar event create failed: ${res.status} ${txt}`);
   }
   type EntryPoint = { entryPointType: string; uri?: string };
-  type EventResponse = { id: string; hangoutLink?: string; conferenceData?: { entryPoints?: EntryPoint[] } };
+  type EventResponse = { id: string; hangoutLink?: string; htmlLink?: string; conferenceData?: { entryPoints?: EntryPoint[] } };
   const data: EventResponse = await res.json();
   const hangoutLink = data.hangoutLink || data.conferenceData?.entryPoints?.find((e: EntryPoint) => e.entryPointType === 'video')?.uri || null;
-  return { eventId: data.id, meetUrl: hangoutLink };
+  return { eventId: data.id, meetUrl: hangoutLink, htmlLink: data.htmlLink || null };
 }

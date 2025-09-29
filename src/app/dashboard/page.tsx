@@ -99,6 +99,41 @@ function classNames(...values: Array<string | undefined | null | false>) {
   return values.filter(Boolean).join(" ");
 }
 
+// Mini stats widget for journal (entries/topics). Fetches from /api/journal/stats
+function JournalMiniStats({ userId }: { userId: string | null }) {
+  const [counts, setCounts] = useState<{ entries: number; topics: number } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if(!userId) return;
+    let active = true;
+    (async () => {
+      try {
+        setLoading(true); setError(null);
+        const res = await fetch('/api/journal/stats', { headers: { 'x-user-id': userId }});
+        const j = await res.json();
+        if(!res.ok) throw new Error(j.error || 'Failed to load');
+        if(active) setCounts({ entries: j.entries, topics: j.topics });
+      } catch(e){ if(active) setError((e as Error).message); }
+      finally { if(active) setLoading(false); }
+    })();
+    return () => { active = false; };
+  }, [userId]);
+  return (
+    <div className="mt-6 grid grid-cols-2 gap-3">
+      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-center">
+        <div className="text-2xl font-bold text-white">{counts ? counts.entries : (loading ? '…' : '0')}</div>
+        <div className="text-[10px] tracking-[0.25em] text-slate-400 uppercase">Entries</div>
+      </div>
+      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-center">
+        <div className="text-2xl font-bold text-blue-300">{counts ? counts.topics : (loading ? '…' : '0')}</div>
+        <div className="text-[10px] tracking-[0.25em] text-slate-400 uppercase">Topics</div>
+      </div>
+      {error && <div className="col-span-2 rounded-xl border border-rose-400/30 bg-rose-500/10 p-2 text-[10px] text-rose-200">{error}</div>}
+    </div>
+  );
+}
+
 export default function DashboardPage() {
   const { session } = useSession();
   const displayName = session?.user?.name || (typeof window !== 'undefined' ? (window.localStorage.getItem('wellnessai:username') || '') : '');
@@ -113,7 +148,7 @@ export default function DashboardPage() {
   const [submittingHealth, setSubmittingHealth] = useState(false);
   const [timeframe, setTimeframe] = useState<'weekly'|'monthly'>("weekly");
   const [journalEntry, setJournalEntry] = useState("");
-  const [journalTopic, setJournalTopic] = useState("");
+  // Removed topic input from quick widget (still supported in full journal page if needed)
   const [entries, setEntries] = useState<{ id: string; entry: string; created_at: string }[]>([]);
   const [journalSaved, setJournalSaved] = useState(false);
   const [completedTasks, setCompletedTasks] = useState<string[]>([]);
@@ -126,7 +161,20 @@ export default function DashboardPage() {
   const [streak, setStreak] = useState<number>(0);
   // loading flag reserved for potential skeleton states (currently unused but kept minimal)
   // const [loadingSummary, setLoadingSummary] = useState(false);
-  const userId = typeof window !== 'undefined' ? window.localStorage.getItem('wellnessai:user_id') : null;
+  // Derive userId: if authenticated session later adds its own ID you could merge; for anonymous usage create a stable UUID similar to chatbot page.
+  const [anonId, setAnonId] = useState<string | null>(null);
+  const userId = session?.user?.id || (typeof window !== 'undefined' ? (window.localStorage.getItem('wellnessai:user_id') || anonId) : null);
+
+  useEffect(() => {
+    if (session?.user?.id) return; // real user present
+    if (typeof window === 'undefined') return;
+    let existing = window.localStorage.getItem('wellnessai:user_id');
+    if (!existing) {
+      existing = crypto.randomUUID();
+      window.localStorage.setItem('wellnessai:user_id', existing);
+    }
+    setAnonId(existing);
+  }, [session?.user?.id]);
   const [upcoming, setUpcoming] = useState<UpcomingBooking[] | null>(null);
   const [loadingUpcoming, setLoadingUpcoming] = useState(false);
   // Daily quote state
@@ -296,13 +344,13 @@ export default function DashboardPage() {
     const trimmed = journalEntry.trim();
     if (!trimmed || !userId) return;
     const payload: Record<string, unknown> = { entry: trimmed };
-    if(journalTopic.trim()) payload.topic = journalTopic.trim();
     const res = await fetch('/api/journal', { method:'POST', headers:{ 'Content-Type':'application/json', 'x-user-id': userId }, body: JSON.stringify(payload) });
     if(res.ok){
       setJournalEntry('');
-      setJournalTopic('');
       setJournalSaved(true);
       fetchJournal();
+      // Fire and forget refresh for stats widget
+      try { if(userId) fetch('/api/journal/stats', { headers:{ 'x-user-id': userId }}); } catch {}
     }
   };
 
@@ -326,19 +374,39 @@ export default function DashboardPage() {
 
   // Submit combined health check (mood + optional sleep)
   const submitHealthCheck = async () => {
-    if(!userId) return;
+    // Ensure we have an ID (anonymous or real). If still missing, attempt to create one.
+    let effectiveUserId = userId;
+    if(!effectiveUserId && typeof window !== 'undefined') {
+      let existing = window.localStorage.getItem('wellnessai:user_id');
+      if(!existing) { existing = crypto.randomUUID(); window.localStorage.setItem('wellnessai:user_id', existing); }
+      setAnonId(existing);
+      effectiveUserId = existing;
+    }
+    if(!effectiveUserId) {
+      console.error('Unable to establish userId for health check');
+      alert('Could not establish a user identity to save your check-in. Please refresh.');
+      return;
+    }
     setSubmittingHealth(true);
     try {
       const moodScore = mapMoodToScore(selectedMood);
       const sleepVal = sleepInput ? parseFloat(sleepInput) : undefined;
       const body: Record<string, unknown> = { mood: moodScore };
       if(!isNaN(Number(sleepVal))) body.sleep_hours = sleepVal;
-      const res = await fetch('/api/health-check', { method:'POST', headers:{'Content-Type':'application/json','x-user-id':userId}, body: JSON.stringify(body) });
+      
+      console.log('Submitting health check:', { body, userId: effectiveUserId, selectedMood, sleepInput });
+      
+      const res = await fetch('/api/health-check', { method:'POST', headers:{'Content-Type':'application/json','x-user-id': effectiveUserId}, body: JSON.stringify(body) });
+      
+      console.log('Health check response:', res.status, res.statusText);
+      
       if(res.ok){
+        console.log('Health check submitted successfully');
+        alert('Health check saved successfully! 🎉');
         setHealthStep(1);
         setSleepInput('');
         // After successful submission, refresh summary or fallback direct fetch to update chart quickly.
-        fetchSummary();
+  fetchSummary(); // will read via latest userId (state) if present
         // Additionally try a direct incremental append for faster UI without waiting network race (optimistic update)
         setTrend(prev => {
           if(!prev) return prev;
@@ -360,7 +428,14 @@ export default function DashboardPage() {
               health: [...healthArr, (moodScore/10 + (!isNaN(Number(sleepVal)) ? Math.min((sleepVal||0)/8,1):0))/2 * 10]
             };
         });
+      } else {
+        const errorText = await res.text();
+        console.error('Health check failed:', res.status, errorText);
+        alert(`Failed to save health check: ${res.status} ${res.statusText}`);
       }
+    } catch (error) {
+      console.error('Health check submission error:', error);
+      alert('Error submitting health check. Please try again.');
     } finally { setSubmittingHealth(false); }
   };
 
@@ -726,66 +801,50 @@ export default function DashboardPage() {
         <article className="rounded-3xl border border-white/5 bg-slate-900/70 p-8 shadow-xl shadow-indigo-500/10 backdrop-blur-xl">
           <header className="flex items-center justify-between">
             <div>
-              <h2 className="text-lg font-semibold text-white">My journal</h2>
-              <p className="mt-1 text-sm text-slate-400">
-                Capture key emotions or wins from today.
-              </p>
+              <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                <NotebookPen className="h-5 w-5 text-rose-300" /> My journal
+              </h2>
+              <p className="mt-1 text-sm text-slate-400">Quick reflection widget. Visit full journal for history & insights.</p>
             </div>
-            <NotebookPen className="h-5 w-5 text-rose-300" />
-          </header>
-          <div className="mt-6 grid gap-3 sm:grid-cols-[160px_1fr]">
-            <div className="flex flex-col gap-2">
-              <input
-                value={journalTopic}
-                onChange={e=>setJournalTopic(e.target.value)}
-                maxLength={120}
-                placeholder="Topic (optional)"
-                className="h-10 w-full rounded-2xl border border-white/10 bg-white/5 px-4 text-sm text-white outline-none transition focus:border-rose-400 focus:ring-4 focus:ring-rose-400/30"
-              />
-              <button
-                type="button"
-                onClick={()=>{ if(!userId) return; window.location.href = '/journal'; }}
-                className="h-10 rounded-2xl border border-white/10 bg-white/5 text-xs font-semibold uppercase tracking-[0.25em] text-slate-300 transition hover:border-white/25 hover:bg-white/10"
-              >View journal</button>
-            </div>
-            <textarea
-            value={journalEntry}
-            onChange={(event) => setJournalEntry(event.target.value)}
-            placeholder="Write down your thoughts and feelings..."
-            className="mt-6 h-32 w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white outline-none transition focus:border-blue-400 focus:ring-4 focus:ring-blue-400/30"
-          />
-          </div>
-          <div className="mt-4 flex flex-wrap items-center gap-3">
             <button
               type="button"
-              onClick={handleSaveEntry}
-              className="inline-flex items-center justify-center gap-2 rounded-full bg-rose-500 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-rose-500/30 transition hover:bg-rose-400"
-            >
-              Save entry
-            </button>
-            {journalSaved && (
-              <span className="inline-flex items-center gap-2 rounded-full border border-emerald-400/40 bg-emerald-500/15 px-4 py-1 text-xs font-semibold uppercase tracking-[0.3em] text-emerald-200">
-                Saved
-              </span>
-            )}
+              onClick={()=>{ if(!userId) return; window.location.href = '/journal'; }}
+              className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.25em] text-slate-300 transition hover:border-white/25 hover:bg-white/10"
+            >Open</button>
+          </header>
+
+          {/* Stats Row */}
+          <JournalMiniStats userId={userId} />
+
+          {/* Entry box */}
+          <div className="mt-6">
+            <textarea
+              value={journalEntry}
+              onChange={(e)=> setJournalEntry(e.target.value)}
+              placeholder="Capture a thought, feeling, or win..."
+              className="h-32 w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white outline-none transition focus:border-rose-400 focus:ring-4 focus:ring-rose-400/30 placeholder:text-slate-400"
+            />
+            <div className="mt-3 flex items-center justify-end text-xs text-slate-400">
+              {journalSaved && <span className="text-emerald-300">Saved ✓</span>}
+            </div>
+            <div className="mt-4 flex items-center gap-3">
+              <button
+                type="button"
+                disabled={!journalEntry.trim()}
+                onClick={handleSaveEntry}
+                className="inline-flex items-center justify-center gap-2 rounded-full bg-gradient-to-r from-rose-500 to-pink-500 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-rose-500/30 transition hover:shadow-rose-500/50 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Save entry
+              </button>
+              <button
+                type="button"
+                onClick={()=> setJournalEntry('')}
+                className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.25em] text-slate-300 transition hover:border-white/25 hover:bg-white/10"
+              >Clear</button>
+            </div>
           </div>
-          <div className="mt-6 space-y-3">
-            <h3 className="text-sm font-semibold uppercase tracking-[0.3em] text-slate-400">
-              Recent entries
-            </h3>
-            {entries.length === 0 ? (
-              <p className="text-sm text-slate-300">No recent entries yet.</p>
-            ) : (
-              <ul className="space-y-3">
-                {entries.map(e => (
-                  <li key={e.id} className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-200">
-                    {e.entry}
-                    <span className="mt-2 block text-[10px] uppercase tracking-[0.3em] text-slate-400">{new Date(e.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+
+          {/* Recent entries block removed per request */}
         </article>
 
         <article className="grid gap-6">

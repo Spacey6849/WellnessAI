@@ -49,6 +49,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'slot must be HH:MM', code: 'invalid_input' }, { status: 400 });
     }
     const supabase = getSupabaseAdmin();
+    // Look up therapist email upfront (needed both for attendee list and email notifications)
+    let therapistEmail: string | null = null;
+    let therapistName: string | null = null;
+    try {
+      const { data: tData } = await supabase.from('therapists').select('email, name').eq('id', therapistId).maybeSingle();
+      therapistEmail = (tData as { email?: string | null } | null)?.email || null;
+      therapistName = (tData as { name?: string | null } | null)?.name || null;
+    } catch { /* ignore here; will warn later if missing */ }
     const userIdHeader = req.headers.get('x-user-id');
     const insertPayload: Database['public']['Tables']['bookings']['Insert'] = {
       therapist_id: therapistId,
@@ -65,8 +73,9 @@ export async function POST(req: NextRequest) {
     const builder = supabase.from('bookings') as unknown as { insert: (row: typeof insertPayload) => Promise<InsertResult> };
 
     const warnings: string[] = [];
-    let meetUrl: string | null = null;
-    let eventId: string | null = null;
+  let meetUrl: string | null = null;
+  let eventId: string | null = null;
+  let eventLink: string | null = null;
     // Calendar event creation strategy:
     // 1. If client supplies user Google access token (x-user-google-token), use user's primary calendar.
     // 2. Else fall back to service account configuration (if present) as before.
@@ -84,7 +93,10 @@ export async function POST(req: NextRequest) {
           end: { dateTime: end.toISOString() },
           conferenceData: { createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: 'hangoutsMeet' } } },
         };
-        if (body?.contactEmail) eventBody.attendees = [{ email: body.contactEmail }];
+  const attendees: { email: string }[] = [];
+  if (body?.contactEmail) attendees.push({ email: body.contactEmail });
+  if (therapistEmail) attendees.push({ email: therapistEmail });
+  if (attendees.length) eventBody.attendees = attendees;
         const resp = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1', {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${userGoogleToken}`, 'Content-Type': 'application/json' },
@@ -92,10 +104,11 @@ export async function POST(req: NextRequest) {
         });
         if (!resp.ok) throw new Error(await resp.text());
         type EntryPoint = { entryPointType: string; uri?: string };
-        type GEventResp = { id?: string; hangoutLink?: string; conferenceData?: { entryPoints?: EntryPoint[] } };
+        type GEventResp = { id?: string; hangoutLink?: string; htmlLink?: string; conferenceData?: { entryPoints?: EntryPoint[] } };
         const data: GEventResp = await resp.json();
         meetUrl = data.hangoutLink || data.conferenceData?.entryPoints?.find((e: EntryPoint) => e.entryPointType === 'video')?.uri || null;
         eventId = data.id || null;
+        eventLink = data.htmlLink || null;
         insertPayload.meet_url = meetUrl;
         insertPayload.calendar_event_id = eventId;
       } catch {
@@ -103,7 +116,7 @@ export async function POST(req: NextRequest) {
       }
     } else {
       // Service account fallback (existing logic simplified)
-      const calId = process.env.GOOGLE_CALENDAR_ID;
+  const calId = process.env.GOOGLE_CALENDAR_ID;
       const svcEmail = process.env.GOOGLE_CLIENT_EMAIL;
       const privKey = process.env.GOOGLE_PRIVATE_KEY;
       const hasAll = !!(calId && svcEmail && privKey);
@@ -112,14 +125,15 @@ export async function POST(req: NextRequest) {
       if (calId && /\.iam\.gserviceaccount\.com$/i.test(calId)) warnings.push('calendar_id_service_account_email');
       if (hasAll) {
         try {
-          const { meetUrl: m, eventId: e } = await createCalendarEventWithMeet({
+          const attendeeEmails = [body?.contactEmail, therapistEmail].filter(Boolean) as string[];
+          const { meetUrl: m, eventId: e, htmlLink } = await createCalendarEventWithMeet({
             summary: 'Therapy Session',
             description: `Therapist session on ${date} at ${slot}`,
             startDate: date,
             startTime: slot,
-            attendeeEmail: body?.contactEmail || null
+            attendeeEmails
           });
-          meetUrl = m; eventId = e;
+          meetUrl = m; eventId = e; eventLink = htmlLink;
           insertPayload.meet_url = meetUrl; insertPayload.calendar_event_id = eventId;
         } catch {
           warnings.push('calendar_failed');
@@ -135,21 +149,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: insertError.message, code: 'db_error' }, { status: 500 });
     }
 
-  // Fetch therapist email for notification
-    let therapistEmail: string | null = null;
-    try {
-      interface TherapistLookup { email: string; name?: string | null }
-      const { data: therapistRow } = await supabase
-        .from('therapists')
-        .select('email, name')
-        .eq('id', therapistId)
-        .maybeSingle();
-      const tRow = therapistRow as TherapistLookup | null;
-      therapistEmail = tRow?.email || null;
-      if (therapistEmail) {
+    // Notifications
+    if (therapistEmail) {
+      try {
         const emailResult = await sendBookingEmail({
           therapistEmail,
-          therapistName: tRow?.name || null,
+          therapistName,
           date,
           slot,
           meetUrl,
@@ -158,11 +163,12 @@ export async function POST(req: NextRequest) {
           contactEmail: body?.contactEmail || null,
         });
         if (!emailResult.ok && emailResult.warning) warnings.push(emailResult.warning);
-      } else {
-        warnings.push('therapist_email_missing');
-      }
-      // Send user confirmation email (if we know their address)
-      if (body?.userEmail) {
+      } catch { warnings.push('therapist_email_failed'); }
+    } else {
+      warnings.push('therapist_email_missing');
+    }
+    if (body?.userEmail) {
+      try {
         const userEmailResult = await sendUserBookingEmail({
           to: body.userEmail,
           date,
@@ -171,12 +177,10 @@ export async function POST(req: NextRequest) {
           notes: body?.notes || null,
         });
         if (!userEmailResult.ok && userEmailResult.warning) warnings.push(userEmailResult.warning);
-      }
-    } catch {
-      warnings.push('therapist_lookup_failed');
+      } catch { warnings.push('user_email_failed'); }
     }
 
-    return NextResponse.json({ ok: true, meetUrl, calendarEventId: eventId, warnings }, { status: 201 });
+  return NextResponse.json({ ok: true, meetUrl, calendarEventId: eventId, calendarEventLink: eventLink, warnings }, { status: 201 });
   } catch (e) {
     const err = e as Error;
     return NextResponse.json({ error: err.message || 'Unknown error', code: 'internal_error' }, { status: 500 });

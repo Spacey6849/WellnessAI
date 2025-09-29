@@ -1,8 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useSession as useNextAuthSession, signIn, signOut } from 'next-auth/react';
-import type { Session } from 'next-auth';
+import { useSession } from '@/lib/useSession';
 import {
   AlertCircle,
   ArrowRight,
@@ -13,7 +12,7 @@ import {
   ShieldCheck,
   UserCheck,
   // Video icon removed (session type selector UI removed)
-  LogIn,
+  // LogIn icon removed (Google auth removed)
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -77,13 +76,18 @@ export default function BookingPage() {
   const [email, setEmail] = useState("");
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [meetUrl, setMeetUrl] = useState<string | null>(null);
+  const [calendarEventId, setCalendarEventId] = useState<string | null>(null);
+  const [calendarEventLink, setCalendarEventLink] = useState<string | null>(null);
+  const [googleToken, setGoogleToken] = useState<string | null>(null);
+  const [googleExpiresAt, setGoogleExpiresAt] = useState<number | null>(null); // epoch ms
   const [warnings, setWarnings] = useState<string[]>([]);
   const [bookingError, setBookingError] = useState<string | null>(null);
   const [bookedSlots, setBookedSlots] = useState<string[]>([]);
-  const { data: nextSession, status: nextStatus } = useNextAuthSession();
+  const { session, status, signOut } = useSession();
   const [authEmail, setAuthEmail] = useState<string | null>(null);
-  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
-  // Supabase auth removed – page now relies solely on NextAuth (Google OAuth)
+  // Email obtained via Google OAuth (not an app login, just contact convenience)
+  const [googleEmail, setGoogleEmail] = useState<string | null>(null);
+  // Google / NextAuth removed; meet creation now disabled unless re‑implemented.
 
   const therapist = useMemo(() => {
     if(!therapists.length) return undefined;
@@ -118,24 +122,78 @@ export default function BookingPage() {
     load();
   },[]);
 
-  // Sync email & access token when session changes
+  // Sync email from credential session
   useEffect(()=>{
-    type SessionWithAccess = Session & { accessToken?: string };
-    const token = (nextSession as SessionWithAccess | null | undefined)?.accessToken;
-    if (token) setGoogleAccessToken(token); else setGoogleAccessToken(null);
-    if (nextSession?.user?.email) {
-      setAuthEmail(nextSession.user.email);
-      setEmail(nextSession.user.email);
+    if (session?.user?.email) {
+      setAuthEmail(session.user.email);
+      setEmail(session.user.email);
     } else {
       setAuthEmail(null);
     }
-  },[nextSession]);
+  },[session]);
 
-  const connectGoogle = useCallback(()=>{
-    // Kept for defensive use if user somehow reaches page unauthenticated
-    setBookingError(null);
-    signIn('google', { callbackUrl: typeof window !== 'undefined' ? window.location.origin + '/booking' : undefined });
-  },[]);
+  // Hydrate ephemeral Google access token & listen for popup postMessage directly (state verified).
+  useEffect(() => {
+    // Initial hydration + prune expired
+    try {
+      const t = sessionStorage.getItem('google_access_token');
+      const expRaw = sessionStorage.getItem('google_access_expires');
+      if (t) setGoogleToken(t); else setGoogleToken(null);
+      if (expRaw) {
+        const exp = Number(expRaw);
+        if (!isNaN(exp) && Date.now() < exp) {
+          setGoogleExpiresAt(exp);
+        } else {
+          try { sessionStorage.removeItem('google_access_token'); sessionStorage.removeItem('google_access_expires'); } catch {}
+          setGoogleExpiresAt(null); setGoogleToken(null);
+        }
+      } else {
+        setGoogleExpiresAt(null);
+      }
+    } catch {/* ignore */}
+
+    interface OAuthMessageSuccess { type: 'google-oauth-success'; token?: string; state?: string; expiresIn?: number }
+    interface OAuthMessageFailure { type: 'google-oauth-failure'; error?: string }
+    type OAuthMessage = OAuthMessageSuccess | OAuthMessageFailure | Record<string, unknown>;
+    async function onMessage(ev: MessageEvent) {
+      const data: OAuthMessage = (ev.data && typeof ev.data === 'object') ? ev.data as OAuthMessage : {};
+      if (!data || typeof data !== 'object') return;
+      if ((data as OAuthMessageSuccess).type === 'google-oauth-success') {
+        const success = data as OAuthMessageSuccess;
+        const expected = sessionStorage.getItem('google_oauth_state');
+        if (expected && success.state && expected !== success.state) {
+          console.warn('Google OAuth state mismatch; ignoring token');
+          return;
+        }
+        sessionStorage.removeItem('google_oauth_state');
+        const token: string | undefined = success.token;
+        if (!token) return;
+        const expiresIn: number = typeof success.expiresIn === 'number' ? success.expiresIn : 3600;
+        const expiresAt = Date.now() + Math.max(0, expiresIn - 30) * 1000; // subtract 30s safety margin
+        try {
+          sessionStorage.setItem('google_access_token', token);
+          sessionStorage.setItem('google_access_expires', String(expiresAt));
+        } catch {/* ignore */}
+        setGoogleToken(token);
+        setGoogleExpiresAt(expiresAt);
+        // Attempt to fetch user's email purely for contact autofill (not authentication) if none present
+        if (!authEmail) {
+          try {
+            const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: `Bearer ${token}` }});
+            if (r.ok) {
+              const uj = await r.json() as { email?: string };
+              if (uj.email) { setGoogleEmail(uj.email); setEmail(uj.email); }
+            }
+          } catch {/* ignore */}
+        }
+      } else if ((data as OAuthMessageFailure).type === 'google-oauth-failure') {
+        const failure = data as OAuthMessageFailure;
+        if (failure.error !== 'popup_closed_by_user') console.warn('Google OAuth failed', failure.error);
+      }
+    }
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [authEmail]);
 
   // Booked slots fetcher (conflict avoidance)
   const fetchBookedSlots = useCallback(async ()=>{
@@ -196,23 +254,24 @@ export default function BookingPage() {
   },[availabilityDays]);
 
   const upcomingDates = useMemo(() => availabilityDays.map(d => d.date), [availabilityDays]);
-
-  const canSubmit = Boolean(selectedTherapist && selectedDate && selectedSlot && authEmail); // require Google auth
+  const googleTokenValid = useMemo(() => !!googleToken && !!googleExpiresAt && Date.now() < googleExpiresAt, [googleToken, googleExpiresAt]);
+  const canSubmit = Boolean(selectedTherapist && selectedDate && selectedSlot && email);
   const currentStep = selectedSlot ? 3 : selectedDate ? 2 : 1;
 
   const submitBooking = async () => {
-  if (!canSubmit || !selectedDate || !selectedSlot || !selectedTherapist) return;
+    if (!canSubmit || !selectedDate || !selectedSlot || !selectedTherapist) return;
     setBookingError(null);
-    if(!authEmail){
-      setBookingError('Please connect Google first so we can sync and send your invite.');
-      return;
+    // prune expired token just before submission
+    if (googleToken && (!googleExpiresAt || Date.now() >= googleExpiresAt)) {
+      try { sessionStorage.removeItem('google_access_token'); sessionStorage.removeItem('google_access_expires'); } catch {}
+      setGoogleToken(null); setGoogleExpiresAt(null);
     }
     const headers: Record<string,string> = { 'Content-Type':'application/json' };
-    if (googleAccessToken) headers['x-user-google-token'] = googleAccessToken;
+    if (googleTokenValid && googleToken) headers['x-user-google-token'] = googleToken;
     const res = await fetch('/api/bookings', {
       method:'POST',
       headers,
-      body: JSON.stringify({ therapistId: selectedTherapist, date: selectedDate, slot: selectedSlot, sessionType, notes, contactEmail: email, userEmail: authEmail })
+      body: JSON.stringify({ therapistId: selectedTherapist, date: selectedDate, slot: selectedSlot, sessionType, notes, contactEmail: email, userEmail: authEmail || email })
     });
     if(res.status === 409) {
       setBookingError('That slot was just booked. Please pick another.');
@@ -229,22 +288,13 @@ export default function BookingPage() {
       return;
     }
     const json = await res.json();
-    let mUrl = json.meetUrl || null;
-    // If user token exists but meet not created (e.g., need explicit consent) try dedicated endpoint once.
-    if (!mUrl && googleAccessToken) {
-      try {
-        const alt = await fetch('/api/google/meet/create', {
-          method: 'POST',
-          headers: { 'Content-Type':'application/json' },
-          body: JSON.stringify({ startDate: selectedDate, startTime: selectedSlot, attendeeEmail: email })
-        });
-        if (alt.ok) {
-          const aj = await alt.json();
-            mUrl = aj.meetUrl || mUrl;
-        }
-      } catch {/* ignore */}
-    }
+    const mUrl = json.meetUrl || null;
+    const evId = json.calendarEventId || null;
+    const evLink = json.calendarEventLink || null; // may add later server side
+    // Google Meet creation disabled (NextAuth removed). mUrl remains null unless backend provides alternative.
     setMeetUrl(mUrl);
+    setCalendarEventId(evId);
+    setCalendarEventLink(evLink);
     setWarnings(Array.isArray(json.warnings) ? json.warnings : []);
     setIsSubmitted(true);
     setTimeout(() => setIsSubmitted(false), 4000);
@@ -444,35 +494,35 @@ export default function BookingPage() {
               <p className="text-[11px] font-semibold uppercase tracking-[0.4em] text-indigo-300">Step 3</p>
               <h3 id="share-context-heading" className="text-base font-semibold text-white">Share context</h3>
             </header>
-            {/* Authentication status (Google only) */}
-            {nextStatus === 'loading' ? (
-              <div className="text-[11px] text-slate-400">Checking Google session…</div>
-            ) : authEmail ? (
+            {/* Authentication status (credential session) */}
+            {status === 'loading' && (
+              <div className="text-[11px] text-slate-400">Checking session…</div>
+            )}
+            {status !== 'loading' && authEmail && (
               <div className="flex flex-wrap items-center gap-3 text-[11px]">
                 <span className="rounded-full border border-emerald-400/40 bg-emerald-500/20 px-3 py-1 font-semibold tracking-[0.3em] text-emerald-200">{authEmail}</span>
                 <button
                   type="button"
-                  onClick={() => { signOut(); }}
+                  onClick={() => { signOut(); setEmail(''); }}
                   className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1 font-semibold uppercase tracking-[0.25em] text-white transition hover:bg-white/20"
-                  aria-label="Sign out of Google"
+                  aria-label="Sign out"
                 >Sign Out</button>
               </div>
-            ) : (
-              <div className="flex flex-col gap-2 rounded-2xl border border-white/10 bg-white/5 p-4 text-[11px] text-slate-300">
-                <p>Sign in with Google to continue.</p>
-                <button type="button" onClick={connectGoogle} className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-4 py-2 font-semibold uppercase tracking-[0.3em] text-white transition hover:bg-white/20"><LogIn className="h-4 w-4"/> Sign In</button>
+            )}
+            {status !== 'loading' && !authEmail && !googleEmail && (
+              <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-blue-400/30 bg-blue-500/10 px-4 py-3 text-[11px] text-blue-200">
+                <span className="font-semibold tracking-[0.25em]">Connect Google to auto-fill email</span>
               </div>
             )}
             <label htmlFor="contact-email" className="text-[11px] font-semibold uppercase tracking-[0.35em] text-slate-300">Contact email</label>
             <input
               id="contact-email"
               value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
+              disabled
               type="email"
-              placeholder="you@example.com"
-              readOnly={!!authEmail}
-              className={`w-full rounded-2xl border border-white/15 bg-black/40 px-4 py-3 text-[13px] text-white outline-none transition focus:border-blue-400 focus:ring-4 focus:ring-blue-400/30 ${authEmail? 'opacity-80 cursor-not-allowed':''}`}
+              placeholder={googleEmail || authEmail ? 'Loading…' : 'you@example.com'}
+              className="w-full cursor-not-allowed rounded-2xl border border-white/15 bg-black/30 px-4 py-3 text-[13px] text-white/90 opacity-80 outline-none"
+              aria-readonly="true"
             />
             <label htmlFor="notes" className="text-[11px] font-semibold uppercase tracking-[0.35em] text-slate-300">Notes (optional)</label>
             <textarea
@@ -501,6 +551,60 @@ export default function BookingPage() {
             {meetUrl && (
               <p className="text-[11px] mt-2 break-all text-blue-300">Meet link: <a className="underline hover:text-blue-200" href={meetUrl} target="_blank" rel="noopener noreferrer">{meetUrl}</a></p>
             )}
+            {(calendarEventLink || calendarEventId) && (
+              <p className="text-[11px] mt-1 break-all text-indigo-300">Calendar event: {calendarEventLink ? (
+                <a className="underline hover:text-indigo-200" href={calendarEventLink} target="_blank" rel="noopener noreferrer">Open event</a>
+              ) : (
+                <span className="text-slate-400">ID: {calendarEventId}</span>
+              )}</p>
+            )}
+            {/* Google Meet / Calendar integration card (inline) */}
+            <div className="mt-6 rounded-2xl border border-white/10 bg-black/30 p-5">
+              <div className="flex items-center justify-between">
+                <h4 className="text-[11px] font-semibold uppercase tracking-[0.35em] text-blue-200">Google Meet</h4>
+                {googleTokenValid && (
+                  <span className="rounded-full bg-emerald-500/20 px-3 py-1 text-[10px] font-semibold text-emerald-200">Connected</span>
+                )}
+              </div>
+              <p className="mt-2 text-[11px] text-slate-300">Connect your Google Calendar to auto-create a Google Meet link when you confirm.</p>
+              {!googleTokenValid ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Use Google OAuth 2.0 directly to match your existing client credentials
+                    const clientId = '821762584781-o7h6hvthiq1g5f632ppbgbm04lead7lc.apps.googleusercontent.com';
+                    // Use custom lightweight OAuth callback (NextAuth was removed; its endpoint returns 410)
+                    const redirectUri = encodeURIComponent(`${window.location.origin}/api/google/oauth/callback`);
+                    const scope = encodeURIComponent('https://www.googleapis.com/auth/calendar.events openid email profile');
+                    const state = crypto.randomUUID();
+                    sessionStorage.setItem('google_oauth_state', state);
+                    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
+                      `client_id=${clientId}&` +
+                      `redirect_uri=${redirectUri}&` +
+                      `response_type=code&` +
+                      `access_type=online&` +
+                      `prompt=consent&` +
+                      `scope=${scope}&` +
+                      `state=${state}`;
+                    const w = window.open(authUrl, 'google-oauth', 'width=500,height=650');
+                    if (!w) return;
+                  }}
+                  className="mt-4 inline-flex items-center gap-2 rounded-full bg-white px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.3em] text-slate-900 shadow hover:bg-slate-100"
+                >Connect Google</button>
+              ) : (
+                <div className="mt-4 flex flex-wrap items-center gap-3 text-[10px] text-slate-300">
+                  <p>Will attach Meet link on confirm.</p>
+                  <button
+                    type="button"
+                    onClick={() => { setGoogleToken(null); setGoogleExpiresAt(null); try { sessionStorage.removeItem('google_access_token'); sessionStorage.removeItem('google_access_expires'); } catch {} }}
+                    className="rounded-full border border-white/20 px-3 py-1 text-[10px] uppercase tracking-wide hover:bg-white/10"
+                  >Disconnect</button>
+                </div>
+              )}
+              {googleToken && !googleTokenValid && (
+                <p className="mt-2 text-[10px] text-amber-300">Token expired – reconnect to create a Meet link.</p>
+              )}
+            </div>
             {!!warnings.length && (
               <ul className="mt-2 space-y-1 text-[10px] text-amber-300/80">
                 {warnings.map(w => <li key={w}>Notice: {w.replace(/_/g,' ')}</li>)}
@@ -546,3 +650,35 @@ export default function BookingPage() {
     </div>
   );
 }
+
+// Listen for OAuth popup messages (placed after component definition to avoid SSR mismatch)
+declare global {
+  interface Window { __google_oauth_listener_added?: boolean }
+  interface GoogleOAuthSuccessMsg { type: 'google-oauth-success'; token: string; expiresIn?: number }
+}
+
+if (typeof window !== 'undefined' && !window.__google_oauth_listener_added) {
+  window.__google_oauth_listener_added = true;
+  window.addEventListener('message', (ev: MessageEvent) => {
+    const d = ev.data as Partial<GoogleOAuthSuccessMsg> | null;
+    if (!d || typeof d !== 'object') return;
+    if (d.type === 'google-oauth-success' && typeof d.token === 'string') {
+      window.dispatchEvent(new CustomEvent('google-token-updated', { detail: d }));
+    }
+  });
+}
+
+// Hook token updates into component state via custom event (cannot inside component after export default without refactor; quick injection approach)
+// This pattern updates all mounted booking pages (only one) without prop drilling.
+if (typeof window !== 'undefined') {
+  window.addEventListener('google-token-updated', (e: Event) => {
+    const detail = (e as CustomEvent<Partial<GoogleOAuthSuccessMsg>>).detail;
+    const token = detail?.token;
+    const expiresIn = detail?.expiresIn; // seconds
+    if (token) {
+      // Store ephemeral token in sessionStorage so component reload picks it up (optional).
+      try { sessionStorage.setItem('google_access_token', token); if (expiresIn) sessionStorage.setItem('google_access_expires', String(Date.now() + expiresIn * 1000)); } catch {}
+    }
+  });
+}
+

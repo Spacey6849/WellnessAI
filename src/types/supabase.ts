@@ -29,6 +29,11 @@ export interface Database {
         Insert: { id?: string; therapist_id: string; user_id?: string | null; date: string; slot: string; session_type?: string | null; notes?: string | null; contact_email?: string | null; meet_url?: string | null; calendar_event_id?: string | null };
         Update: Partial<Database['public']['Tables']['bookings']['Insert']>;
       };
+      user_profiles: {
+        Row: { user_id: string; email: string; username: string | null; display_name: string | null; avatar_url: string | null; phone: string | null; bio: string | null; timezone: string | null; created_at: string; updated_at: string };
+        Insert: { user_id: string; email: string; username?: string | null; display_name?: string | null; avatar_url?: string | null; phone?: string | null; bio?: string | null; timezone?: string | null };
+        Update: Partial<Database['public']['Tables']['user_profiles']['Insert']> & { updated_at?: string };
+      };
     };
     Functions: {
       toggle_post_like: { Args: { p_post_id: string }; Returns: { post_id: string; likes: string[] }[] };

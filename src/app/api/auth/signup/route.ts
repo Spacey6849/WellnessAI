@@ -20,7 +20,7 @@ function firstExisting(names: string[]): string {
 
 export async function POST(req: NextRequest) {
   try {
-  const { email, password, username, phone } = await req.json();
+  const { email, password, username, phone } = await req.json(); // phone optional, stored in user_profiles.phone
     if (!email || !password) return new Response(JSON.stringify({ error: 'email & password required'}), { status: 400 });
     const supabase = getSupabaseAdmin();
 
@@ -35,7 +35,8 @@ export async function POST(req: NextRequest) {
 
     // Set username if provided
   type ProfileUpdate = { username?: string|null; display_name?: string|null; email_verification_token?: string|null; email_verification_token_expires_at?: string|null };
-    const baseProfile: ProfileUpdate = {};
+  const baseProfile: ProfileUpdate & { email?: string|null } = {};
+  baseProfile.email = email; // store duplicate for quick lookups
     if (username) {
       baseProfile.username = username;
       baseProfile.display_name = username;
@@ -47,7 +48,7 @@ export async function POST(req: NextRequest) {
     const hashed = await bcrypt.hash(password, 10);
     (baseProfile as any).hashed_password = hashed;
     (baseProfile as any).role = 'user';
-    await (supabase as any).from('user_profiles').update(baseProfile).eq('user_id', userId);
+  await (supabase as any).from('user_profiles').update(baseProfile).eq('user_id', userId);
 
     // Generate verification token & store
     const token = crypto.randomBytes(32).toString('hex');

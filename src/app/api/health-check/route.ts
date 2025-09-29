@@ -17,16 +17,23 @@ export async function POST(req: Request){
     const body = await req.json().catch(()=>({})) as { mood?: number; sleep_hours?: number; note?: string };
     const supabase = getAdmin();
 
-    // Insert mood entry if provided
+    // 1. Insert mood entry (do not embed sleep hours here to avoid coupling) if mood provided.
     if(typeof body.mood === 'number'){
-      const { error: moodErr } = await supabase.from('mood_entries').insert({ user_id: uid, mood: body.mood, sleep_hours: typeof body.sleep_hours === 'number' ? body.sleep_hours : null, note: body.note || null });
-      if(moodErr) return NextResponse.json({ error: moodErr.message }, { status:500 });
+      const { error: moodErr } = await supabase.from('mood_entries').insert({ user_id: uid, mood: body.mood, note: body.note || null });
+      if(moodErr && !/duplicate key/i.test(moodErr.message)) {
+        // Return only if not a duplicate; duplicates are treated as idempotent no-op.
+        return NextResponse.json({ error: moodErr.message }, { status:500 });
+      }
     }
-    // Upsert sleep entry for today if provided
+
+    // 2. Upsert sleep entry (idempotent) if provided. Use explicit onConflict merge pattern.
     if(typeof body.sleep_hours === 'number'){
       const today = new Date().toISOString().slice(0,10);
-      const { error: sleepErr } = await supabase.from('sleep_entries').upsert({ user_id: uid, date: today, hours: body.sleep_hours });
-      if(sleepErr) return NextResponse.json({ error: sleepErr.message }, { status:500 });
+      const { error: sleepErr } = await supabase.from('sleep_entries')
+        .upsert({ user_id: uid, date: today, hours: body.sleep_hours }, { onConflict: 'user_id,date' });
+      if(sleepErr && !/duplicate key/i.test(sleepErr.message)) {
+        return NextResponse.json({ error: sleepErr.message }, { status:500 });
+      }
     }
 
     return NextResponse.json({ ok:true });

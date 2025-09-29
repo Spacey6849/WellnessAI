@@ -39,6 +39,7 @@ export function AuthModal() {
   const [confirm, setConfirm] = useState("");
   const [fullName, setFullName] = useState("");
   const [username, setUsername] = useState("");
+  const [phone, setPhone] = useState("");
   const [authRole, setAuthRole] = useState<'user' | 'admin'>('user');
 
   const close = useCallback(() => {
@@ -122,16 +123,45 @@ export function AuthModal() {
 
         <form
           className="mt-8 space-y-6"
-          onSubmit={(e) => {
+          onSubmit={async (e) => {
             e.preventDefault();
-            // Placeholder submit logic
-            close();
+            try {
+              let ok = false;
+              if (isSignup) {
+                if (!identifier || !password || !username) return;
+                if (password !== confirm) return;
+                const res = await fetch('/api/auth/signup', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ email: identifier, password, username, fullName, phone })
+                });
+                ok = res.ok;
+              } else {
+                if (!identifier || !password) return;
+                const res = await fetch('/api/auth/login', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ identifier, password, role: authRole })
+                });
+                ok = res.ok;
+              }
+              if (ok) {
+                // Notify listeners (useSession) to refresh cookie-based session
+                window.dispatchEvent(new Event('cred-session-updated'));
+              }
+            } catch (err) {
+              console.error('auth error', err);
+            } finally {
+              close();
+            }
           }}
         >
           {isSignup && (
             <div className="grid gap-5 md:grid-cols-2">
-              <Field label="Full name" placeholder="Jane Doe" value={fullName} onChange={setFullName} autoFocus />
-              <Field label="Username" placeholder="unique name" value={username} onChange={setUsername} />
+              <Field label="Username" placeholder="unique name" value={username} onChange={setUsername} autoFocus />
+              <Field label="Email address" type="email" placeholder="you@example.com" value={identifier} onChange={setIdentifier} />
+              <Field label="Full name" placeholder="Jane Doe" value={fullName} onChange={setFullName} />
+              <Field label="Phone Number" type="tel" placeholder="+1 555 012 3456" value={phone} onChange={setPhone} />
             </div>
           )}
           {!isSignup && (
@@ -143,16 +173,7 @@ export function AuthModal() {
               autoFocus
             />
           )}
-          {isSignup && (
-            <Field
-              label="Email address"
-              type="email"
-              placeholder="you@example.com"
-              value={identifier}
-              onChange={setIdentifier}
-              autoFocus={!fullName && !username}
-            />
-          )}
+          {/* Email field moved into grid above for signup */}
           <Field
             label="Password"
             type="password"

@@ -15,6 +15,9 @@ create extension if not exists pgcrypto with schema extensions;
 -- =============================
 create table if not exists public.user_profiles (
   user_id uuid primary key, -- decouple FK to auth.users; application layer ensures alignment
+  -- Store email (duplicated from auth.users.email for easier joins / lookups). We keep it nullable
+  -- in case legacy rows exist; a backfill statement + trigger below maintains sync.
+  email text unique,
   username text unique,
   display_name text,
   avatar_url text,
@@ -33,6 +36,52 @@ create table if not exists public.user_profiles (
 
 -- Backfill new columns for legacy deployments where table existed before these fields were added.
 alter table public.user_profiles add column if not exists username text unique;
+alter table public.user_profiles add column if not exists email text;
+do $$ begin
+  -- Add unique index for email if not already present (can't declare unique twice idempotently if column may pre-exist without constraint)
+  begin
+    execute 'create unique index if not exists user_profiles_email_key on public.user_profiles(email)';
+  exception when others then null; end;
+end $$;
+
+-- =====================================================================
+-- MIGRATION: Relax user_journal FK for pseudo / anonymous client IDs
+-- Rationale: Frontend currently supplies a client-generated UUID via header (x-user-id)
+-- even when the user hasn't completed auth/signup, so no row exists in user_profiles.
+-- This caused:  insert or update on table "user_journal" violates foreign key constraint
+-- Solution: Drop FK (if present) to allow journaling before account creation while keeping
+-- the column name (user_id) for future linkage. When a user later signs up, client can
+-- reuse the same UUID so historical entries naturally associate in-app logic.
+-- NOTE: If you require strict referential integrity, revert by re‑adding the FK after
+-- ensuring all orphan user_id values have corresponding user_profiles rows.
+do $$ begin
+  if exists (
+    select 1 from information_schema.table_constraints
+      where table_schema='public'
+        and table_name='user_journal'
+        and constraint_name='user_journal_user_id_fkey'
+  ) then
+    alter table public.user_journal drop constraint user_journal_user_id_fkey;
+  end if;
+exception when others then null; end $$;
+
+-- Strengthen data quality: topic length + mood_snapshot range (idempotent add constraints)
+do $$ begin
+  begin
+    alter table public.user_journal add constraint user_journal_topic_len
+      check (topic is null or char_length(topic) <= 120);
+  exception when others then null; end;
+  begin
+    alter table public.user_journal add constraint user_journal_mood_snapshot_range
+      check (mood_snapshot is null or (mood_snapshot between 1 and 5));
+  exception when others then null; end;
+end $$;
+
+-- Helpful partial index for mood_snapshot analytics (skip nulls)
+create index if not exists idx_user_journal_user_mood_created
+  on public.user_journal(user_id, mood_snapshot, created_at desc)
+  where mood_snapshot is not null;
+
 alter table public.user_profiles add column if not exists display_name text;
 alter table public.user_profiles add column if not exists avatar_url text;
 alter table public.user_profiles add column if not exists role text not null default 'user';
@@ -94,6 +143,27 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
 after insert on auth.users
 for each row execute procedure public.handle_new_user();
+
+-- =============================================
+-- EMAIL SYNC FROM auth.users -> public.user_profiles
+-- =============================================
+create or replace function public.sync_user_profile_email()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  update public.user_profiles set email = new.email where user_id = new.id;
+  return new;
+end;$$;
+
+drop trigger if exists trg_auth_user_email_sync on auth.users;
+create trigger trg_auth_user_email_sync
+after insert or update of email on auth.users
+for each row execute procedure public.sync_user_profile_email();
+
+-- Backfill existing rows where email null
+update public.user_profiles p
+set email = u.email
+from auth.users u
+where p.user_id = u.id and p.email is null;
 
 -- =============================
 -- COMMUNITY: POSTS & REPLIES
@@ -429,13 +499,18 @@ for insert with check (auth.uid() = user_id);
 -- =============================
 -- JOURNAL ENTRIES
 -- =============================
+-- Journal entries intentionally DO NOT maintain a foreign key to user_profiles to
+-- support pre-auth / anonymous journaling with a client-generated UUID. This allows
+-- capturing thoughts before account creation. When a real account is later created,
+-- an application-level migration step can reassign orphan rows (update user_id) and
+-- optionally reintroduce an FK if strict integrity is desired.
+-- DO NOT add a FK here unless you have a backfill + merge strategy.
 create table if not exists public.user_journal (
   id uuid primary key default uuid_generate_v4(),
-  user_id uuid not null references public.user_profiles(user_id) on delete cascade,
-  -- Optional categorization / topic label for entry (short). Added via migration; idempotent.
-  topic text,
+  user_id uuid not null, -- no FK by design (see rationale above)
+  topic text, -- optional categorization / label
   entry text not null check (char_length(entry) <= 8000),
-  mood_snapshot int, -- optional capture at time of writing
+  mood_snapshot int, -- optional capture at time of writing (1..5 UI bounded)
   created_at timestamptz not null default now()
 );
 
@@ -744,13 +819,11 @@ do $$ begin
     exception when others then null; end;
   end if;
 
-  -- user_journal.user_id
-  if exists (select 1 from information_schema.columns where table_schema='public' and table_name='user_journal' and column_name='user_id') then
-    begin
-      alter table public.user_journal drop constraint if exists user_journal_user_id_fkey;
-      alter table public.user_journal add constraint user_journal_user_id_fkey foreign key (user_id) references public.user_profiles(user_id) on delete cascade;
-    exception when others then null; end;
-  end if;
+  -- user_journal.user_id (INTENTIONALLY left without FK; see table definition rationale)
+  -- Previous deployments may have had a FK; ensure it stays dropped.
+  begin
+    alter table public.user_journal drop constraint if exists user_journal_user_id_fkey;
+  exception when others then null; end;
 
   -- sleep_entries.user_id
   if exists (select 1 from information_schema.columns where table_schema='public' and table_name='sleep_entries' and column_name='user_id') then

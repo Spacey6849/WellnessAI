@@ -128,8 +128,10 @@ export function Navbar() {
                   aria-expanded={userMenuOpen}
                 >
                   <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse" aria-hidden />
-                  <span className="font-semibold tracking-tight text-slate-100 max-w-[140px] truncate text-[13px]">{session.user.name}</span>
-                  <span className="text-[10px] uppercase tracking-[0.3em] text-slate-400">{session.user.role}</span>
+                  <span className="font-semibold tracking-tight text-slate-100 max-w-[160px] truncate text-[13px]">
+                    {(session.user.name || 'User')}
+                    <span className="ml-1 text-[10px] uppercase tracking-[0.3em] text-blue-300/80">{session.user.role || 'user'}</span>
+                  </span>
                   <ChevronDown size={14} className={`transition ${userMenuOpen? 'rotate-180':''}`} />
                 </button>
                 <AnimatePresence>
@@ -151,8 +153,10 @@ export function Navbar() {
                           </div>
                         )}
                         <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm font-semibold text-white leading-tight">{session.user.name}</p>
-                          <p className="truncate text-[10px] uppercase tracking-[0.3em] text-slate-400">{session.user.role}</p>
+                          <p className="truncate text-sm font-semibold text-white leading-tight flex items-center gap-2">
+                            <span>{session.user.name || 'User'}</span>
+                            <span className="rounded-full bg-blue-500/15 px-2 py-0.5 text-[9px] font-medium uppercase tracking-[0.25em] text-blue-300">{session.user.role || 'user'}</span>
+                          </p>
                         </div>
                       </div>
                       <div className="my-1 h-px bg-white/10" />
@@ -231,7 +235,7 @@ export function Navbar() {
                   <div className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black/30 px-4 py-3">
                     <div className="flex flex-col text-xs text-slate-200">
                       <span className="font-semibold text-white">{session.user.name}</span>
-                      <span className="text-[10px] tracking-[0.3em] uppercase text-slate-400">user</span>
+                      <span className="text-[10px] tracking-[0.3em] uppercase text-blue-300">{session.user.role}</span>
                     </div>
                     <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse" />
                   </div>

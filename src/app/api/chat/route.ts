@@ -1,71 +1,90 @@
 import { NextRequest } from "next/server";
-import { buildTherapistPrompt } from "@/lib/ai/systemPrompt";
+import { buildDynamicContext, enforceWellnessSafety } from "@/lib/ai/contextBuilder";
+import { generateWithOllama, isOllamaEnabled, OllamaChatMessage } from "@/lib/ai/ollamaClient";
+import { wellnessFallback } from "@/lib/wellnessFallback";
 
-// Minimal interfaces describing only what we use from the Gemini SDK so we avoid `any`.
-interface GeminiGenerateContentResponse { response: { text(): string } }
-interface GeminiGenerativeModel { generateContent(input: { contents: Array<{ role: string; parts: { text: string }[] }> }): Promise<GeminiGenerateContentResponse>; }
-interface GeminiClient { getGenerativeModel(opts: { model: string; systemInstruction?: string }): GeminiGenerativeModel; }
-
-// Use dynamic import so the SDK is included only on the server. We keep a cached instance.
-let genAI: GeminiClient | undefined;
-async function getGemini(): Promise<GeminiClient> {
-  if (!genAI) {
-    const { GoogleGenerativeAI } = await import("@google/generative-ai");
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
-    genAI = new GoogleGenerativeAI(apiKey) as unknown as GeminiClient; // Cast to minimal surface we defined
-  }
-  return genAI;
-}
+// (Gemini + JSON fallback removed per requirement – Ollama only except crisis)
 
 interface IncomingMessage { role: string; content: string }
 
 export async function POST(req: NextRequest) {
   try {
-    const { messages } = (await req.json()) as { messages: unknown };
+  const body = await req.json();
+  const { messages, model: requestedModel } = body as { messages: unknown; model?: string };
     if (!Array.isArray(messages)) {
       return new Response(JSON.stringify({ error: "messages must be an array" }), { status: 400 });
     }
 
-  // System instruction externalized for maintainability & versioning (see `src/lib/ai/systemPrompt.ts`).
-  const systemPreamble = buildTherapistPrompt();
+    // Get the latest user message for analysis
+    const lastUserMessage = (messages as IncomingMessage[])
+      .filter(m => m.role === 'user')
+      .pop()?.content || '';
 
-    const gen = await getGemini();
-    const envModel = process.env.GEMINI_MODEL?.trim();
-    const candidates = envModel
-      ? [envModel]
-      : [
-          "gemini-1.5-flash-latest",
-          "gemini-1.5-flash",
-          "gemini-1.5-flash-8b",
-          "gemini-1.5-pro-latest",
-        ];
+    // Crisis: retain existing JSON-based immediate response for safety + resource injection
+    if (wellnessFallback.isCrisisMessage(lastUserMessage)) {
+      const crisisResponse = wellnessFallback.getEnhancedResponse(lastUserMessage);
+      const emergencyResources = wellnessFallback.getEmergencyResources();
+      
+      const fullResponse = `${crisisResponse}\n\n🚨 **Emergency Resources:**\n${emergencyResources.crisis_lines.map(line => 
+        `• ${line.name}: ${line.number}\n  ${line.description}`
+      ).join('\n')}`;
 
-    const contents = (messages as IncomingMessage[]).map((m) => ({
-      role: m.role === "user" ? "user" : "model",
-      parts: [{ text: m.content }],
-    }));
+      return new Response(JSON.stringify({ content: fullResponse, source: 'crisis_fallback' }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
 
-  let text = "";
-  let lastErr: unknown = null;
-    for (const modelName of candidates) {
+  // Non-crisis explicit helpline request detection (user asking for numbers/help lines but not expressing active intent)
+  const helplineRegex = /(help\s?line|hot\s?line|helpline|crisis (?:text|chat)|support number|suicide number|mental health number)/i;
+  const wantsHelplines = helplineRegex.test(lastUserMessage) && !wellnessFallback.isCrisisMessage(lastUserMessage);
+
+    // Build dynamic knowledge context (optional feature flag)
+    const { systemPrompt: dynamicSystemPrompt } = buildDynamicContext(lastUserMessage);
+    let text = "";
+    let source: string = "";
+
+    // Attempt Ollama first if enabled
+    if (isOllamaEnabled()) {
       try {
-        const model = gen.getGenerativeModel({ model: modelName, systemInstruction: systemPreamble });
-        const result = await model.generateContent({ contents });
-        text = result.response.text();
-        if (text) break; // success
-      } catch (e) { lastErr = e; }
-    }
-    if (!text) {
-      const msg = (lastErr as { message?: string } | null)?.message || "Model failed without details";
-      console.error("Gemini all candidates failed", msg);
-      return new Response(
-        JSON.stringify({ error: "Gemini request failed", details: msg }),
-        { status: 502, headers: { "content-type": "application/json" } }
-      );
+        const ollamaMessages: OllamaChatMessage[] = (messages as IncomingMessage[]).map(m => ({
+          role: m.role === 'user' ? 'user' : 'assistant',
+          content: m.content
+        }));
+        const ollamaResponse = await generateWithOllama(ollamaMessages, { model: requestedModel, extraContext: dynamicSystemPrompt });
+        if (ollamaResponse && ollamaResponse.trim().length > 0) {
+          text = ollamaResponse.trim();
+          const modelTag = requestedModel || process.env.OLLAMA_MODEL || 'default';
+          source = `ollama:${modelTag}`;
+        }
+      } catch (ollamaErr) {
+        console.warn('Ollama generation failed, will consider Gemini / fallback:', (ollamaErr as Error)?.message);
+      }
     }
 
-    return new Response(JSON.stringify({ content: text }), {
+    if (!text) {
+      // If Ollama is disabled return instructive error; no fallback allowed now.
+      if (!isOllamaEnabled()) {
+        return new Response(JSON.stringify({ error: 'Ollama disabled and fallback removed. Set OLLAMA_ENABLED=true and ensure service reachable.' }), { status: 503, headers: { 'content-type': 'application/json' } });
+      }
+      // If enabled but empty response, produce minimal therapist-style nudge.
+      text = "I’m here with you. Could you share a little more about what you’re feeling right now?";
+      source = 'ollama:empty_response_recovery';
+    }
+
+    // Append helplines if explicitly requested (already handled crisis above)
+    if (wantsHelplines) {
+      const resources = wellnessFallback.getEmergencyResources();
+      const helplineBlock = `\n\n📞 Helpful Support Resources:\n${resources.crisis_lines.map(l => `• ${l.name}: ${l.number}\n  ${l.description}`).join('\n')}`;
+      if (!text.includes(resources.crisis_lines[0].number)) {
+        text += helplineBlock;
+      }
+    }
+
+    // Safety filter + disclaimer
+  const { safeText, flagged } = enforceWellnessSafety(text);
+  const finalText = safeText; // disclaimer intentionally suppressed per user request
+
+    return new Response(JSON.stringify({ content: finalText, source, flagged }), {
       headers: { "content-type": "application/json" },
     });
   } catch (err: unknown) {

@@ -89,6 +89,96 @@ SUPABASE_SERVICE_ROLE=...
 SUPABASE_URL=...
 ```
 
+### Local LLM (Ollama) Integration (Optional)
+
+Enable a locally hosted model via [Ollama](https://ollama.com/) for private, offline-friendly generation. Falls back automatically to Gemini (if configured) or JSON intent responses.
+
+```
+OLLAMA_ENABLED=true
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.2
+```
+
+Steps:
+
+1. Install Ollama from https://ollama.com
+2. Pull a model (examples):
+   - `ollama pull llama3.2`
+   - `ollama pull mistral`
+3. Start Ollama service (usually runs automatically):
+   - macOS/Linux: it runs as a background service
+   - Windows (WSL) example: `ollama serve`
+4. Start the app `npm run dev`
+5. Chat endpoint priority order:
+   - Crisis intent → emergency JSON response
+   - Ollama (if enabled & responds)
+   - Gemini (if complex & configured with `GEMINI_API_KEY`)
+   - JSON fallback intents (pattern matched)
+
+If `OLLAMA_ENABLED` is false or the server is unreachable, the system gracefully proceeds to Gemini / fallback without crashing.
+
+#### Using Gemma Model
+
+Gemma (Google lightweight models) can also be served through Ollama.
+
+Pull a Gemma variant (examples):
+
+```
+ollama pull gemma:2b
+ollama pull gemma:7b
+```
+
+Set globally via env:
+
+```
+OLLAMA_MODEL=gemma:2b
+```
+
+Or per request (overrides env) by adding a `model` field in the POST body to `/api/chat`:
+
+```json
+{
+  "model": "gemma:2b",
+  "messages": [{ "role": "user", "content": "Help me manage evening anxiety" }]
+}
+```
+
+Response JSON will include `source": "ollama:gemma:2b"` when that model generated the answer.
+
+### Dynamic Wellness Context & Safety Layer (Optional)
+
+You can enable lightweight retrieval-augmented grounding for the AI chatbot using curated micro‑knowledge units (breathing, grounding, behavioral activation, etc.).
+
+```
+WELLNESS_DYNAMIC_CONTEXT=true
+```
+
+When enabled:
+
+- The last user message is scanned for keywords and up to 3 matching wellness knowledge topics are embedded into the system prompt.
+- Topics live in `src/data/wellnessKnowledge.ts` (compact summaries + micro‑strategies).
+- A safety filter (`enforceWellnessSafety`) scrubs obviously disallowed patterns (medication dosage, self‑harm instructions, pseudo-diagnosis phrases).
+- A consistent AI companion disclaimer is appended if missing.
+
+Disable anytime by setting the flag to `false` or removing it.
+
+### Speech Mode + Local Model Selection
+
+The chatbot page includes a Speech mode (browser microphone + streaming transcription). You can also choose a local Ollama model while in Speech mode. When you stop recording, the transcribed text is sent to `/api/chat` with the selected `model` (if set) so the same local model pipeline is used as in text chat.
+
+Behavior:
+
+- Tap mic → live transcription (browser STT by default).
+- Tap again → finalizes transcript, sends to backend.
+- If `OLLAMA_ENABLED=true` the system attempts local generation first.
+- Assistant reply is optionally converted to audio via `/api/tts`.
+
+### Helpline / Hotline Keyword Assistance
+
+If a user explicitly asks for a helpline/hotline (e.g. _"What is the suicide hotline?"_, _"Give me crisis helpline numbers"_) but the message does not trigger a crisis intent pattern, the response automatically appends a short curated list of support lines (988, Crisis Text Line, SAMHSA). Full crisis phrasing still routes through the higher-priority crisis branch with dedicated messaging and safety emphasis.
+
+This logic lives in `src/app/api/chat/route.ts` and uses regex detection plus `wellnessFallback.getEmergencyResources()`.
+
 ## 🚀 How to Run
 
 1. Clone this repository.
