@@ -80,6 +80,7 @@ export default function ChatbotPage() {
   const [mode, setMode] = useState<Mode>("chat");
   // Model selection for local LLM (Ollama) - default blank means use server logic
   const [ollamaModel, setOllamaModel] = useState<string>("");
+  const [globalModel, setGlobalModel] = useState<'auto'|'gemini'|'local'>('auto');
   const availableLocalModels = [
     { value: "", label: "Auto (env / fallback)" },
     { value: "gemma:2b", label: "Gemma 2B" },
@@ -272,7 +273,7 @@ export default function ChatbotPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           messages: [...messages, userMsg],
-          ...(ollamaModel ? { model: ollamaModel } : {})
+          ...(globalModel === 'gemini' ? { model: 'gemini' } : ollamaModel ? { model: ollamaModel } : {})
         }),
       });
   const data = await res.json();
@@ -624,8 +625,8 @@ export default function ChatbotPage() {
     } : c));
 
     try {
-  const payload: { messages: ChatMessage[]; model?: string } = { messages: [...messages, userMsg] };
-      if (ollamaModel) payload.model = ollamaModel; // include selected local model
+      const payload: { messages: ChatMessage[]; model?: string } = { messages: [...messages, userMsg] };
+      if (globalModel === 'gemini') payload.model = 'gemini'; else if (ollamaModel) payload.model = ollamaModel; // include selected local model
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1093,21 +1094,34 @@ export default function ChatbotPage() {
           >
             <div className="flex flex-1 flex-col gap-2">
               {mode === 'chat' && (
-                <div className="flex flex-wrap items-center gap-3">
-                  <label className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-400">
-                    Local Model
-                  </label>
-                  <select
-                    value={ollamaModel}
-                    onChange={(e) => setOllamaModel(e.target.value)}
-                    className="rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-xs text-slate-200 focus:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-400/30"
-                  >
-                    {availableLocalModels.map(m => (
-                      <option key={m.value} value={m.value}>{m.label}</option>
-                    ))}
-                  </select>
-                  {ollamaModel && (
-                    <span className="text-[10px] text-blue-300/70">Using {ollamaModel}</span>
+                <div className="flex flex-col gap-2">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <label className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-400">Mode</label>
+                    <div className="flex gap-2 text-xs">
+                      {(['auto','gemini','local'] as Array<'auto'|'gemini'|'local'>).map(m => (
+                        <button key={m} type="button" onClick={() => setGlobalModel(m)} className={`px-3 py-1.5 rounded-full border transition ${globalModel===m? 'border-blue-400 bg-blue-500/30 text-white':'border-white/15 bg-white/5 text-slate-300 hover:border-white/30'}`}>{m.toUpperCase()}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {globalModel === 'local' && (
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-400">Local Model</label>
+                      <select
+                        value={ollamaModel}
+                        onChange={(e) => setOllamaModel(e.target.value)}
+                        className="rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-xs text-slate-200 focus:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-400/30"
+                      >
+                        {availableLocalModels.map(m => (
+                          <option key={m.value} value={m.value}>{m.label}</option>
+                        ))}
+                      </select>
+                      {ollamaModel && (
+                        <span className="text-[10px] text-blue-300/70">Using {ollamaModel}</span>
+                      )}
+                    </div>
+                  )}
+                  {globalModel === 'gemini' && (
+                    <p className="text-[11px] text-emerald-300/80">Gemini mode active (uses GEMINI_API_KEY server-side)</p>
                   )}
                 </div>
               )}
@@ -1122,21 +1136,34 @@ export default function ChatbotPage() {
               )}
               {mode === "speech" && (
                 <div className="flex flex-col gap-3 rounded-xl border border-white/15 bg-black/30 px-4 py-4 text-sm text-slate-200">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <label className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-400">
-                      Local Model
-                    </label>
-                    <select
-                      value={ollamaModel}
-                      onChange={(e) => setOllamaModel(e.target.value)}
-                      className="rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-xs text-slate-200 focus:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-400/30"
-                    >
-                      {availableLocalModels.map(m => (
-                        <option key={m.value} value={m.value}>{m.label}</option>
-                      ))}
-                    </select>
-                    {ollamaModel && (
-                      <span className="text-[10px] text-blue-300/70">Using {ollamaModel}</span>
+                  <div className="flex flex-col gap-2">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-400">Mode</label>
+                      <div className="flex gap-2 text-xs">
+                        {(['auto','gemini','local'] as Array<'auto'|'gemini'|'local'>).map(m => (
+                          <button key={m} type="button" onClick={() => setGlobalModel(m)} className={`px-3 py-1.5 rounded-full border transition ${globalModel===m? 'border-blue-400 bg-blue-500/30 text-white':'border-white/15 bg-white/5 text-slate-300 hover:border-white/30'}`}>{m.toUpperCase()}</button>
+                        ))}
+                      </div>
+                    </div>
+                    {globalModel === 'local' && (
+                      <div className="flex flex-wrap items-center gap-3">
+                        <label className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-400">Local Model</label>
+                        <select
+                          value={ollamaModel}
+                          onChange={(e) => setOllamaModel(e.target.value)}
+                          className="rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-xs text-slate-200 focus:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-400/30"
+                        >
+                          {availableLocalModels.map(m => (
+                            <option key={m.value} value={m.value}>{m.label}</option>
+                          ))}
+                        </select>
+                        {ollamaModel && (
+                          <span className="text-[10px] text-blue-300/70">Using {ollamaModel}</span>
+                        )}
+                      </div>
+                    )}
+                    {globalModel === 'gemini' && (
+                      <p className="text-[11px] text-emerald-300/80">Gemini mode active (uses GEMINI_API_KEY)</p>
                     )}
                   </div>
                   <div className="flex items-center gap-4">

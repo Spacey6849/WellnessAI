@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { buildDynamicContext, enforceWellnessSafety } from "@/lib/ai/contextBuilder";
 import { generateWithOllama, isOllamaEnabled, OllamaChatMessage } from "@/lib/ai/ollamaClient";
+import { generateWithGemini, isGeminiEnabled } from "@/lib/ai/geminiClient";
 import { wellnessFallback } from "@/lib/wellnessFallback";
 
 // (Gemini + JSON fallback removed per requirement – Ollama only except crisis)
@@ -43,32 +44,63 @@ export async function POST(req: NextRequest) {
     let text = "";
     let source: string = "";
 
-    // Attempt Ollama first if enabled
-    if (isOllamaEnabled()) {
-      try {
-        const ollamaMessages: OllamaChatMessage[] = (messages as IncomingMessage[]).map(m => ({
-          role: m.role === 'user' ? 'user' : 'assistant',
-          content: m.content
-        }));
-        const ollamaResponse = await generateWithOllama(ollamaMessages, { model: requestedModel, extraContext: dynamicSystemPrompt });
-        if (ollamaResponse && ollamaResponse.trim().length > 0) {
-          text = ollamaResponse.trim();
-          const modelTag = requestedModel || process.env.OLLAMA_MODEL || 'default';
-          source = `ollama:${modelTag}`;
-        }
-      } catch (ollamaErr) {
-        console.warn('Ollama generation failed, will consider Gemini / fallback:', (ollamaErr as Error)?.message);
-      }
-    }
+    const wantsGeminiExplicit = requestedModel === 'gemini';
+    const allowGeminiFallback = isGeminiEnabled();
 
-    if (!text) {
-      // If Ollama is disabled return instructive error; no fallback allowed now.
-      if (!isOllamaEnabled()) {
-        return new Response(JSON.stringify({ error: 'Ollama disabled and fallback removed. Set OLLAMA_ENABLED=true and ensure service reachable.' }), { status: 503, headers: { 'content-type': 'application/json' } });
+    // Route logic:
+    // 1. If explicit Gemini -> try Gemini first.
+    // 2. Else attempt Ollama if enabled.
+    // 3. If Ollama disabled or failed and Gemini available -> Gemini fallback.
+    // 4. Else minimal nudge.
+
+    if (wantsGeminiExplicit) {
+      if (!isGeminiEnabled()) {
+        return new Response(JSON.stringify({ error: 'Gemini requested but GEMINI_API_KEY not configured' }), { status: 400, headers: { 'content-type': 'application/json' } });
       }
-      // If enabled but empty response, produce minimal therapist-style nudge.
-      text = "I’m here with you. Could you share a little more about what you’re feeling right now?";
-      source = 'ollama:empty_response_recovery';
+      try {
+        const geminiMessages = (messages as IncomingMessage[]).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+        const geminiResp = await generateWithGemini(geminiMessages, { extraContext: dynamicSystemPrompt });
+        text = geminiResp.trim();
+        source = 'gemini';
+      } catch (ge) {
+        console.error('Gemini explicit mode failed', ge);
+        return new Response(JSON.stringify({ error: 'Gemini generation failed' }), { status: 500, headers: { 'content-type': 'application/json' } });
+      }
+    } else {
+      // Attempt Ollama first if enabled
+      if (isOllamaEnabled()) {
+        try {
+          const ollamaMessages: OllamaChatMessage[] = (messages as IncomingMessage[]).map(m => ({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.content
+          }));
+          const ollamaResponse = await generateWithOllama(ollamaMessages, { model: requestedModel, extraContext: dynamicSystemPrompt });
+          if (ollamaResponse && ollamaResponse.trim().length > 0) {
+            text = ollamaResponse.trim();
+            const modelTag = requestedModel || process.env.OLLAMA_MODEL || 'default';
+            source = `ollama:${modelTag}`;
+          }
+        } catch (ollamaErr) {
+          console.warn('Ollama generation failed, will fallback if Gemini available:', (ollamaErr as Error)?.message);
+        }
+      }
+      if (!text && allowGeminiFallback) {
+        try {
+          const geminiMessages = (messages as IncomingMessage[]).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+          const geminiResp = await generateWithGemini(geminiMessages, { extraContext: dynamicSystemPrompt });
+          text = geminiResp.trim();
+          source = 'gemini:fallback';
+        } catch (ge) {
+          console.warn('Gemini fallback failed', (ge as Error)?.message);
+        }
+      }
+      if (!text) {
+        if (!isOllamaEnabled() && !allowGeminiFallback) {
+          return new Response(JSON.stringify({ error: 'No model available. Enable OLLAMA or set GEMINI_API_KEY.' }), { status: 503, headers: { 'content-type': 'application/json' } });
+        }
+        text = "I’m here with you. Could you share a little more about what you’re feeling right now?";
+        source = source || 'nudge';
+      }
     }
 
     // Append helplines if explicitly requested (already handled crisis above)

@@ -117,6 +117,25 @@ Steps:
 
 If `OLLAMA_ENABLED` is false or the server is unreachable, the system gracefully proceeds to Gemini / fallback without crashing.
 
+### Gemini Cloud Mode (Optional)
+
+Add a hosted model option using Google Gemini. Set an API key in your environment:
+
+```
+GEMINI_API_KEY=your_key_here
+GEMINI_MODEL=gemini-1.5-flash
+```
+
+Usage:
+
+- In the chatbot page, choose `GEMINI` mode near the bottom input (Mode selector: AUTO / GEMINI / LOCAL).
+- `AUTO` = Try local Ollama first, fallback to Gemini if configured.
+- `GEMINI` = Force Gemini even if a local model is available.
+- `LOCAL` = Only send a specific Ollama model (selected in dropdown) or env default.
+
+Security: The API key is only read server‑side in `/api/chat`; the client never receives it.
+
+
 #### Using Gemma Model
 
 Gemma (Google lightweight models) can also be served through Ollama.
