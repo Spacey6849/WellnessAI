@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState, useCallback } from 'react';
-import { NotebookPen, RefreshCw, Search, Brain, Calendar, Sparkles, MessageSquare, TrendingUp, BookOpen } from 'lucide-react';
+import { NotebookPen, RefreshCw, Search, Brain, Calendar, Sparkles, MessageSquare, TrendingUp, BookOpen, Plus, X } from 'lucide-react';
 
 interface JournalEntry { id: string; entry: string; created_at: string; topic?: string | null; mood_snapshot?: number | null }
 interface JournalStats { entries: number; topics: number; avgMood: number | null }
@@ -13,6 +13,12 @@ export default function JournalPage(){
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedFilter, setSelectedFilter] = useState<'all' | 'recent' | 'topic'>('all');
   const [expandedEntry, setExpandedEntry] = useState<string | null>(null);
+  const [showNewModal, setShowNewModal] = useState(false);
+  const [newEntryText, setNewEntryText] = useState('');
+  const [newEntryTopic, setNewEntryTopic] = useState('');
+  const [newEntryMood, setNewEntryMood] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   
   const userId = typeof window !== 'undefined' ? window.localStorage.getItem('wellnessai:user_id') : null;
 
@@ -27,7 +33,25 @@ export default function JournalPage(){
     finally { setLoading(false); }
   }, [userId]);
 
-  // New entry creation removed per request; page is now read-only overview.
+  const handleCreate = async () => {
+    if(!userId) return;
+    const payload: Record<string, unknown> = { entry: newEntryText.trim() };
+    if(newEntryMood) payload.mood_snapshot = newEntryMood;
+    if(newEntryTopic.trim()) payload.topic = newEntryTopic.trim();
+    if(!newEntryText.trim()) return;
+    setSaving(true); setSaveError(null);
+    try {
+      const res = await fetch('/api/journal', { method:'POST', headers:{ 'Content-Type':'application/json','x-user-id': userId }, body: JSON.stringify(payload) });
+      const j = await res.json();
+      if(!res.ok) throw new Error(j.error || 'Failed');
+      setShowNewModal(false);
+      setNewEntryText(''); setNewEntryTopic(''); setNewEntryMood(null);
+      fetchEntries();
+      // Refresh stats asynchronously
+      try { await fetch('/api/journal/stats', { headers:{ 'x-user-id': userId }}); } catch {}
+    } catch (e){ setSaveError((e as Error).message); }
+    finally { setSaving(false); }
+  };
 
   const moodOptions = [
     { value: 1, emoji: '😢', label: 'Very Low' },
@@ -102,7 +126,13 @@ export default function JournalPage(){
         {/* Action Bar */}
         <div className="mt-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-wrap gap-3">
-            {/* New entry button removed per request (page is read-only) */}
+            <button
+              type="button"
+              onClick={()=> setShowNewModal(true)}
+              className="inline-flex items-center gap-2 rounded-full border border-rose-400/30 bg-rose-500/20 px-4 py-3 text-sm font-medium text-rose-100 backdrop-blur-xl hover:bg-rose-500/30 hover:border-rose-400/50"
+            >
+              <Plus className="h-4 w-4"/> New Entry
+            </button>
             
             <button className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-3 text-sm font-medium text-slate-200 backdrop-blur-xl hover:bg-white/10">
               <Brain className="h-4 w-4 text-purple-300"/> AI Insights
@@ -253,6 +283,42 @@ export default function JournalPage(){
           </div>
         )}
       </div>
+
+      {showNewModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-lg rounded-3xl border border-white/10 bg-slate-900/90 p-6 shadow-lg relative">
+            <button aria-label="Close" onClick={()=> setShowNewModal(false)} className="absolute right-4 top-4 text-slate-400 hover:text-slate-200"><X className="h-5 w-5"/></button>
+            <h2 className="text-xl font-semibold text-white flex items-center gap-2 mb-4"><NotebookPen className="h-5 w-5 text-rose-300"/> New Journal Entry</h2>
+            {saveError && <div className="mb-4 rounded-xl border border-rose-400/30 bg-rose-500/10 p-3 text-sm text-rose-200">{saveError}</div>}
+            <div className="flex flex-col gap-4">
+              <div>
+                <label className="block text-xs uppercase tracking-widest text-slate-400 mb-2">Topic (optional)</label>
+                <input value={newEntryTopic} onChange={e=> setNewEntryTopic(e.target.value)} maxLength={120} placeholder="e.g. stress, gratitude" className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-rose-400/50 focus:outline-none focus:ring-2 focus:ring-rose-400/20" />
+              </div>
+              <div>
+                <label className="block text-xs uppercase tracking-widest text-slate-400 mb-2">Mood (optional)</label>
+                <div className="flex flex-wrap gap-2">
+                  {moodOptions.map(m => (
+                    <button key={m.value} type="button" onClick={()=> setNewEntryMood(m.value)} className={`flex items-center gap-1 rounded-full border px-3 py-1.5 text-xs transition ${newEntryMood===m.value? 'border-rose-400 bg-rose-500/20 text-rose-100':'border-white/10 bg-white/5 text-slate-300 hover:border-white/25'}`}>{m.emoji} {m.label}</button>
+                  ))}
+                  {newEntryMood && <button type="button" onClick={()=> setNewEntryMood(null)} className="text-xs underline text-slate-400 ml-1">Clear</button>}
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs uppercase tracking-widest text-slate-400 mb-2">Entry</label>
+                <textarea value={newEntryText} onChange={e=> setNewEntryText(e.target.value)} rows={6} placeholder="Write freely..." className="w-full resize-y rounded-xl border border-white/10 bg-white/5 p-3 text-sm text-white focus:border-rose-400/50 focus:outline-none focus:ring-2 focus:ring-rose-400/20" />
+                <div className="mt-1 text-right text-[11px] text-slate-500">{newEntryText.length}/8000</div>
+              </div>
+              <div className="flex items-center justify-end gap-3 pt-2">
+                <button type="button" onClick={()=> setShowNewModal(false)} className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.25em] text-slate-300 hover:bg-white/10">Cancel</button>
+                <button type="button" disabled={!newEntryText.trim() || saving} onClick={handleCreate} className="inline-flex items-center gap-2 rounded-full bg-gradient-to-r from-rose-500 to-pink-500 px-6 py-2 text-sm font-semibold text-white shadow disabled:opacity-40">
+                  {saving ? 'Saving...' : 'Save Entry'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

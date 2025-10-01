@@ -147,10 +147,9 @@ export default function DashboardPage() {
   const [healthStep, setHealthStep] = useState<1|2>(1); // 1 = mood, 2 = sleep
   const [submittingHealth, setSubmittingHealth] = useState(false);
   const [timeframe, setTimeframe] = useState<'weekly'|'monthly'>("weekly");
-  const [journalEntry, setJournalEntry] = useState("");
+  // Removed inline journal entry textarea per request; creation now happens on full journal page modal
   // Removed topic input from quick widget (still supported in full journal page if needed)
-  const [entries, setEntries] = useState<{ id: string; entry: string; created_at: string }[]>([]);
-  const [journalSaved, setJournalSaved] = useState(false);
+  const [entries, setEntries] = useState<{ id: string; entry: string; created_at: string }[]>([]); // retained because summary logic may still reference last journal
   const [completedTasks, setCompletedTasks] = useState<string[]>([]);
   const [statCards, setStatCards] = useState<StatCardData[]>([]);
   const [trend, setTrend] = useState<TrendSummary | null>(null);
@@ -334,25 +333,9 @@ export default function DashboardPage() {
     }
   }, [selectedMood]);
 
-  useEffect(() => {
-    if (!journalSaved) return;
-    const timeout = window.setTimeout(() => setJournalSaved(false), 2800);
-    return () => window.clearTimeout(timeout);
-  }, [journalSaved]);
+  // journalSaved timeout logic removed (no save action here anymore)
 
-  const handleSaveEntry = async () => {
-    const trimmed = journalEntry.trim();
-    if (!trimmed || !userId) return;
-    const payload: Record<string, unknown> = { entry: trimmed };
-    const res = await fetch('/api/journal', { method:'POST', headers:{ 'Content-Type':'application/json', 'x-user-id': userId }, body: JSON.stringify(payload) });
-    if(res.ok){
-      setJournalEntry('');
-      setJournalSaved(true);
-      fetchJournal();
-      // Fire and forget refresh for stats widget
-      try { if(userId) fetch('/api/journal/stats', { headers:{ 'x-user-id': userId }}); } catch {}
-    }
-  };
+  // handleSaveEntry removed; creation handled on /journal page
 
   const toggleTask = (taskId: string) => {
     setCompletedTasks((prev) =>
@@ -816,33 +799,7 @@ export default function DashboardPage() {
           {/* Stats Row */}
           <JournalMiniStats userId={userId} />
 
-          {/* Entry box */}
-          <div className="mt-6">
-            <textarea
-              value={journalEntry}
-              onChange={(e)=> setJournalEntry(e.target.value)}
-              placeholder="Capture a thought, feeling, or win..."
-              className="h-32 w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white outline-none transition focus:border-rose-400 focus:ring-4 focus:ring-rose-400/30 placeholder:text-slate-400"
-            />
-            <div className="mt-3 flex items-center justify-end text-xs text-slate-400">
-              {journalSaved && <span className="text-emerald-300">Saved ✓</span>}
-            </div>
-            <div className="mt-4 flex items-center gap-3">
-              <button
-                type="button"
-                disabled={!journalEntry.trim()}
-                onClick={handleSaveEntry}
-                className="inline-flex items-center justify-center gap-2 rounded-full bg-gradient-to-r from-rose-500 to-pink-500 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-rose-500/30 transition hover:shadow-rose-500/50 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                Save entry
-              </button>
-              <button
-                type="button"
-                onClick={()=> setJournalEntry('')}
-                className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.25em] text-slate-300 transition hover:border-white/25 hover:bg-white/10"
-              >Clear</button>
-            </div>
-          </div>
+          {/* Entry box removed - directs users to full journal */}
 
           {/* Recent entries block removed per request */}
         </article>
